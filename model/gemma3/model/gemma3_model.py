@@ -373,13 +373,13 @@ class GemmaLISAForCausalLM(nn.Module):
         seg_token_mask = torch.cat(
             [
                 seg_token_mask,
-                torch.zeros((seg_token_mask.shape[0], 1)).bool().cuda(),
+                torch.zeros((seg_token_mask.shape[0], 1)).bool().to(input_ids.device),
             ],
             dim=1,
         )
         # hack for IMAGE_TOKEN_INDEX (we suppose that there is only one image, and it is in the front)
         seg_token_mask = torch.cat(
-            [torch.zeros((seg_token_mask.shape[0], 255)).bool().cuda(), seg_token_mask],
+            [torch.zeros((seg_token_mask.shape[0], 255)).bool().to(input_ids.device), seg_token_mask],
             dim=1,
         )
         
@@ -551,7 +551,7 @@ class GemmaLISAForCausalLM(nn.Module):
         """
         # 入力準備
         attention_mask = torch.ones_like(input_ids)
-        offset = torch.Tensor([0, 1]).long().cuda()
+        offset = torch.Tensor([0, 1]).long().to(input_ids.device)
         label_dummy = None
         masks_dummy = [None]
         label_list_dummy = [None]
