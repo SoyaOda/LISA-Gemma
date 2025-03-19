@@ -1,0 +1,35 @@
+バッチサイズ: 1
+SAM用画像テンソル形状: torch.Size([1, 3, 1024, 1024])
+Gemma3用画像テンソル形状: torch.Size([1, 3, 224, 224])
+入力ID形状: torch.Size([3, 66])
+ラベル形状: torch.Size([3, 66])
+マスクリスト長: 1
+
+サンプル 1:
+  画像パス: H:/download/LISA-dataset/dataset\ade20k\images\training\ADE_train_00005730.jpg
+  マスク形状: torch.Size([3, 256, 256])
+  入力テキスト: <bos>System: You are a helpful visual assistant that can segment objects in images.
+
+User: <im_start><unk><im_end>
+What's in this picture?
+
+User: Yes. [SEG].
+
+Assistant: <im_start><unk><im_end>
+What's in this picture?
+
+Assistant: Yes. [SEG].<unk><unk><unk><unk>
+
+  元の会話:
+System: You are a helpful visual assistant that can segment objects in images.
+
+User: <im_start><image><im_end>
+What's in this picture?
+
+User: Yes. [SEG].
+
+Assistant: <im_start><image><im_end>
+What's in this picture?
+
+Assistant: Yes. [SEG].
+

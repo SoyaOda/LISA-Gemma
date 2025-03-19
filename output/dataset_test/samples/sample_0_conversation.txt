@@ -1,0 +1,14 @@
+画像パス: H:/download/LISA-dataset/dataset\ade20k\images\training\ADE_train_00002854.jpg
+
+会話:
+System: You are a helpful visual assistant that can segment objects in images.
+
+User: <image>
+Can you describe this image?
+
+User: Yes. [SEG].
+
+Assistant: <image>
+Can you describe this image?
+
+Assistant: Yes. [SEG].
