@@ -11,302 +11,347 @@ import torch
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoProcessor
+from PIL import Image
 
 from model.GemmaLISA import LISAForCausalLM
 from model.segment_anything.utils.transforms import ResizeLongestSide
 from model.gemma3.mm_utils import GemmaImageProcessor, get_gemma_processor
 from model.segment_anything import sam_model_registry
+from utils.utils import DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
 
 def parse_args():
     """コマンドライン引数を解析"""
-    parser = argparse.ArgumentParser(description='Gemma LISA モデルのテスト')
-    
-    parser.add_argument('--model_name', type=str, default='google/gemma-3-4b-it',
-                        help='使用するGemma3モデル名（例: google/gemma-3-4b-it）')
-    
-    parser.add_argument('--sam_checkpoint', type=str, default='C:/Users/oda/foodlmm-llama/weights/sam_vit_h_4b8939.pth',
-                        help='SAMモデルのチェックポイントパス')
-    
-    parser.add_argument('--image_path', type=str, default='test_images/cat.jpg',
-                        help='テスト用画像パス')
-    
-    parser.add_argument('--query', type=str, default='この画像の中の猫をセグメンテーションしてください。',
-                        help='画像に対する質問')
-    
-    parser.add_argument('--output_dir', type=str, default='output',
-                        help='出力ディレクトリ')
-    
-    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
-                        help='使用するデバイス (cuda/cpu)')
-    
-    parser.add_argument('--precision', type=str, default='fp16',
-                        choices=['fp32', 'fp16', 'bf16'],
-                        help='精度 (fp32/fp16/bf16)')
-    
-    parser.add_argument('--load_in_8bit', action='store_true',
-                        help='モデルを8bit精度でロード')
-    
-    parser.add_argument('--load_in_4bit', action='store_true',
-                        help='モデルを4bit精度でロード')
-    
-    parser.add_argument('--sam_only', action='store_true',
-                        help='SAMモデルのみをテスト（Gemma3モデルはロードしない）')
-    
+    parser = argparse.ArgumentParser(description="LISA-Gemma3モデルテスト")
+    parser.add_argument(
+        "--version",
+        type=str,
+        default="google/gemma-3-4b-it",
+        help="モデル名",
+    )
+    parser.add_argument(
+        "--model_max_length",
+        type=int,
+        default=512,
+        help="モデルの最大シーケンス長",
+    )
+    parser.add_argument(
+        "--vision_pretrained",
+        type=str,
+        default="C:/Users/oda/foodlmm-llama/weights/sam_vit_h_4b8939.pth",
+        help="SAMの事前学習重み",
+    )
+    parser.add_argument(
+        "--image",
+        type=str,
+        default="test_images/example.jpg",
+        help="テスト画像へのパス",
+    )
+    parser.add_argument(
+        "--precision",
+        default="bf16",
+        type=str,
+        choices=["fp32", "bf16", "fp16"],
+        help="precision for inference",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default='cuda' if torch.cuda.is_available() else 'cpu',
+        help='使用するデバイス (cuda/cpu)'
+    )
+    parser.add_argument(
+        "--save_mask",
+        action="store_true",
+        help="セグメンテーションマスクを保存するかどうか"
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="output",
+        help="出力ディレクトリ"
+    )
     return parser.parse_args()
 
 
-def preprocess_image(image_path, sam_processor, gemma_processor):
-    """画像の前処理を行う関数"""
-    # 画像を読み込み
-    image = cv2.imread(image_path)
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+def visualize_and_save_mask(image, mask, output_path=None):
+    """セグメンテーションマスクの可視化と保存"""
+    plt.figure(figsize=(10, 10))
     
-    # SAM用の画像前処理
-    sam_transform = ResizeLongestSide(1024)
-    image_sam = sam_transform.apply_image(image)
-    image_size = image_sam.shape[:2]
-    
-    # ピクセル値を正規化
-    pixel_mean = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
-    pixel_std = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
-    
-    image_sam_tensor = torch.from_numpy(image_sam).permute(2, 0, 1).contiguous()
-    image_sam_tensor = (image_sam_tensor - pixel_mean) / pixel_std
-    
-    # パディング
-    h, w = image_sam_tensor.shape[-2:]
-    padh = 1024 - h
-    padw = 1024 - w
-    image_sam_tensor = torch.nn.functional.pad(image_sam_tensor, (0, padw, 0, padh))
-    
-    # Gemma3用の画像前処理（必要な場合）
-    image_gemma = gemma_processor(image) if gemma_processor else None
-    
-    return image_sam_tensor, image_gemma, image_size, image
-
-
-def test_sam_only(args):
-    """SAMモデルのみのテスト"""
-    print("=" * 50)
-    print("SAMモデルのみのテスト")
-    print("=" * 50)
-    
-    device = torch.device(args.device)
-    
-    # SAMモデルのロード
-    print(f"SAMモデルをロード中: {args.sam_checkpoint}")
-    try:
-        sam = sam_model_registry["vit_h"](checkpoint=args.sam_checkpoint)
-        sam.to(device)
-        print("SAMモデルのロードに成功しました")
-    except Exception as e:
-        print(f"SAMモデルのロード中にエラーが発生しました: {e}")
-        import traceback
-        traceback.print_exc()
-        return
-    
-    # 画像の前処理
-    try:
-        print(f"画像を処理中: {args.image_path}")
-        image_tensor, _, image_size, original_image = preprocess_image(
-            args.image_path, None, None
-        )
-        image_tensor = image_tensor.to(device)
-    except Exception as e:
-        print(f"画像処理中にエラーが発生しました: {e}")
-        return
-    
-    # テキスト埋め込みを生成（実際のモデルを模倣）
-    text_embedding = torch.randn(1, 256, device=device)
-    
-    # SAMでマスク生成
-    print("SAMによるマスク生成を実行中...")
-    with torch.no_grad():
-        # 画像エンコーダで特徴を抽出
-        image_embedding = sam.image_encoder(image_tensor.unsqueeze(0))
-        
-        # プロンプトエンコーダでテキスト埋め込みを処理
-        sparse_embeddings, dense_embeddings = sam.prompt_encoder(
-            points=None,
-            boxes=None,
-            masks=None,
-            text_embeds=text_embedding.unsqueeze(1),
-        )
-        
-        # マスクデコーダでマスクを生成
-        low_res_masks, iou_predictions = sam.mask_decoder(
-            image_embeddings=image_embedding,
-            image_pe=sam.prompt_encoder.get_dense_pe(),
-            sparse_prompt_embeddings=sparse_embeddings,
-            dense_prompt_embeddings=dense_embeddings,
-            multimask_output=True,  # 複数マスクを生成
-        )
-        
-        # マスクの後処理
-        masks = sam.postprocess_masks(
-            low_res_masks,
-            input_size=image_size,
-            original_size=original_image.shape[:2],
-        )
-        
-    print("SAMによるマスク生成が成功しました!")
-    
-    # 最良のマスクを選択
-    best_mask_idx = iou_predictions.argmax(dim=1)
-    best_mask = masks[0, best_mask_idx[0]].cpu().numpy()
-    
-    # 結果の可視化
-    visualize_results(original_image, best_mask, args.output_dir, prefix="sam_only")
-
-
-def visualize_results(original_image, mask, output_dir, prefix="result"):
-    """結果の可視化"""
-    plt.figure(figsize=(15, 5))
-    
-    # 元画像
+    # 画像を表示
     plt.subplot(1, 3, 1)
-    plt.imshow(original_image)
+    plt.imshow(image)
     plt.title("Original Image")
-    plt.axis('off')
+    plt.axis("off")
     
-    # マスク
+    # マスクを表示
     plt.subplot(1, 3, 2)
-    plt.imshow(mask, cmap='gray')
-    plt.title("Predicted Mask")
-    plt.axis('off')
+    plt.imshow(mask.cpu().numpy(), cmap="gray")
+    plt.title("Generated Mask")
+    plt.axis("off")
     
-    # マスクを重ねた画像
+    # マスクを重ねた画像を表示
     plt.subplot(1, 3, 3)
-    masked_img = original_image.copy()
-    mask_3channel = np.stack([mask > 0.5] * 3, axis=2)
-    masked_img = masked_img * 0.7 + np.ones_like(masked_img) * np.array([0, 255, 0]) * 0.3 * mask_3channel
-    plt.imshow(masked_img.astype(np.uint8))
-    plt.title("Image with Mask")
-    plt.axis('off')
+    # マスクをRGBA形式に変換
+    mask_rgba = np.zeros((*mask.shape, 4), dtype=np.float32)
+    mask_rgba[..., 0] = 1.0  # R
+    mask_rgba[..., 3] = mask.cpu().numpy() * 0.6  # Alpha
     
-    # 保存
-    plt.savefig(os.path.join(output_dir, f"{prefix}_visualization.png"))
-    plt.close()
+    # 画像を表示
+    plt.imshow(image)
+    # マスクを重ねる
+    plt.imshow(mask_rgba)
+    plt.title("Image with Mask Overlay")
+    plt.axis("off")
     
-    # マスクをバイナリ画像として保存
-    cv2.imwrite(
-        os.path.join(output_dir, f"{prefix}_mask.png"),
-        (mask > 0.5).astype(np.uint8) * 255
-    )
+    plt.tight_layout()
+    
+    if output_path:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        plt.savefig(output_path)
+        print(f"マスク画像を保存しました: {output_path}")
+    
+    plt.show()
 
 
 def main():
-    """メイン関数"""
     args = parse_args()
     
-    # 出力ディレクトリの作成
-    os.makedirs(args.output_dir, exist_ok=True)
+    print(f"Gemma-LISA テストスクリプト")
+    print(f"モデル: {args.version}")
+    print(f"デバイス: {args.device}")
     
-    # SAMのみのテストモード
-    if args.sam_only:
-        test_sam_only(args)
-        return
-    
-    # デバイスとデータ型の設定
+    # デバイスを設定
     device = torch.device(args.device)
-    if args.precision == 'fp32':
-        torch_dtype = torch.float32
-    elif args.precision == 'fp16':
-        torch_dtype = torch.float16
-    elif args.precision == 'bf16':
+    
+    # 精度を設定
+    if args.precision == "bf16" and torch.cuda.is_available():
         torch_dtype = torch.bfloat16
+    elif args.precision == "fp16" and torch.cuda.is_available():
+        torch_dtype = torch.float16
     else:
         torch_dtype = torch.float32
     
-    # トークナイザーの初期化
-    print(f"トークナイザーをロード中: {args.model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
-    
-    # [SEG]トークンをトークナイザーに追加
-    print("[SEG]トークンを追加中...")
-    tokenizer.add_tokens("[SEG]", special_tokens=True)
-    seg_token_idx = tokenizer.convert_tokens_to_ids("[SEG]")
-    
-    print(f"[SEG]トークンのID: {seg_token_idx}")
-    
-    # 画像開始・終了トークンが存在するか確認し、必要に応じて追加
-    tokens_to_add = []
-    if "<im_start>" not in tokenizer.get_vocab():
-        tokens_to_add.append("<im_start>")
-    if "<im_end>" not in tokenizer.get_vocab():
-        tokens_to_add.append("<im_end>")
-    if tokens_to_add:
-        tokenizer.add_tokens(tokens_to_add, special_tokens=True)
-    
-    # Gemma LISA モデルのロード
-    print(f"モデルをロード中: {args.model_name}")
-    
-    model = LISAForCausalLM.from_pretrained(
-        args.model_name,
-        torch_dtype=torch_dtype,
-        low_cpu_mem_usage=True,
-        vision_pretrained=args.sam_checkpoint,
-        seg_token_idx=seg_token_idx,
-        load_in_8bit=args.load_in_8bit,
-        load_in_4bit=args.load_in_4bit,
-        trust_remote_code=True,
-    )
-    
-    # 必要に応じて埋め込み層のサイズを調整
-    if model.get_input_embeddings().weight.shape[0] < len(tokenizer):
-        model.resize_token_embeddings(len(tokenizer))
-    
-    # モデルをデバイスに移動
-    model.to(device)
-    
-    # 画像プロセッサの初期化
-    print("画像プロセッサを初期化中...")
-    gemma_processor = GemmaImageProcessor(get_gemma_processor(args.model_name))
-    
-    # 画像の前処理
-    print(f"画像を処理中: {args.image_path}")
-    image_sam, image_gemma, image_size, original_image = preprocess_image(
-        args.image_path, None, gemma_processor
-    )
-    
-    # プロンプトの構築
-    system_prompt = "You are a helpful visual assistant that can segment objects in images."
-    prompt = f"System: {system_prompt}\n\nUser: <im_start><image><im_end>{args.query}\n\nAssistant:"
-    
-    # トークン化
-    print("入力をトークン化中...")
-    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
-    
-    # 評価モードに設定
-    model.eval()
-    
-    # 推論実行
-    print("推論実行中...")
-    with torch.no_grad():
-        output_ids, texts, pred_masks = model.evaluate(
-            pixel_values=image_gemma.unsqueeze(0).to(device),
-            images=image_sam.unsqueeze(0).to(device),
-            input_ids=input_ids,
-            resize_list=[image_size],
-            original_size_list=[original_image.shape[:2]],
-            max_new_tokens=256,
-            tokenizer=tokenizer,
+    try:
+        print("トークナイザーとプロセッサを初期化しています...")
+        # トークナイザーとプロセッサを初期化
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.version,
+            model_max_length=args.model_max_length,
+            padding_side="right",
+            use_fast=False,
+            trust_remote_code=True,
         )
-    
-    # 結果の表示
-    print("出力テキスト:", texts[0])
-    
-    # マスクの可視化と保存
-    if len(pred_masks) > 0:
-        print("マスクを可視化中...")
-        mask = pred_masks[0].cpu().numpy()
-        visualize_results(original_image, mask[0], args.output_dir)
-    else:
-        print("マスクが生成されませんでした")
-    
-    print(f"結果は {args.output_dir} に保存されました")
+        tokenizer.pad_token = tokenizer.unk_token
+        
+        # AutoProcessorを初期化
+        processor = AutoProcessor.from_pretrained(
+            args.version,
+            trust_remote_code=True,
+        )
+        
+        # 特殊トークンの追加
+        tokenizer.add_tokens("[SEG]")
+        seg_token_idx = tokenizer.convert_tokens_to_ids("[SEG]")
+        # [SEG]トークンがない場合、追加する
+        if seg_token_idx == tokenizer.unk_token_id:
+            tokenizer.add_tokens("[SEG]")
+            seg_token_idx = tokenizer.convert_tokens_to_ids("[SEG]")
+        print(f"[SEG]トークンのID: {seg_token_idx}")
+        
+        # 画像トークンの追加
+        tokenizer.add_tokens([DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True)
+        
+        # モデルの設定
+        model_args = {
+            "seg_token_idx": seg_token_idx,
+            "vision_pretrained": args.vision_pretrained,
+        }
+        
+        print("モデルを初期化しています...")
+        model = LISAForCausalLM.from_pretrained(
+            args.version,
+            low_cpu_mem_usage=True,
+            torch_dtype=torch_dtype,
+            trust_remote_code=True,
+            **model_args
+        )
+        
+        model.to(device)
+        print("モデル初期化完了")
+        
+        # 画像をロード
+        if os.path.exists(args.image):
+            print(f"画像 {args.image} をロードしています...")
+            image = Image.open(args.image).convert('RGB')
+            image_np = np.array(image)
+            
+            # 質問の構築
+            prompt = "この画像に写っているものを教えてください。また、主要な物体を[SEG]で分割してください。"
+            
+            # Gemma3のチャットテンプレートを使用して入力を準備
+            messages = [
+                {"role": "user", "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": prompt}
+                ]}
+            ]
+            
+            print(f"入力プロンプト: {prompt}")
+            
+            # プロセッサを使用して入力をエンコード
+            # Transformers 4.50.0以降の仕様に合わせてパラメータを追加
+            inputs = processor.apply_chat_template(
+                messages, 
+                add_generation_prompt=True,
+                tokenize=True,      # トークン化も一緒に行う
+                return_dict=True,   # 辞書形式で返す
+                return_tensors="pt",
+            )
+            
+            # 入力をデバイスに転送
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            
+            # 注: 上記の方法でもエラーが発生する場合、以下の代替手法を試してください
+            # (1) 文字列出力を直接トークナイズする方法:
+            """
+            # まずテンプレートを適用（文字列を取得）
+            prompt_text = processor.apply_chat_template(
+                messages, 
+                add_generation_prompt=True,
+                tokenize=False
+            )
+            
+            # 手動でトークナイズして辞書形式の入力を作成
+            inputs = tokenizer(prompt_text, return_tensors="pt")
+            
+            # 画像があれば、pixel_valuesを追加
+            if "image" in messages[0]["content"][0]["type"]:
+                # 画像を処理
+                image = messages[0]["content"][0]["image"]
+                pixel_values = processor.image_processor(images=image, return_tensors="pt").pixel_values
+                inputs["pixel_values"] = pixel_values
+            
+            # デバイスに転送
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            """
+            
+            # (2) 最新のプロセッサAPIが利用できない場合、分離して処理する:
+            """
+            # テキスト部分をトークナイズ
+            text = prompt
+            text_inputs = tokenizer(text, return_tensors="pt").to(device)
+            
+            # 画像を処理
+            image_processor = processor.image_processor
+            image_inputs = image_processor(images=image, return_tensors="pt").to(device)
+            
+            # モデルに渡す入力を作成
+            inputs = {
+                "input_ids": text_inputs.input_ids,
+                "attention_mask": text_inputs.attention_mask,
+                "pixel_values": image_inputs.pixel_values
+            }
+            """
+            
+            # SAM用の高解像度画像を準備
+            sam_transform = ResizeLongestSide(1024)
+            sam_image = sam_transform.apply_image(image_np)
+            sam_image_tensor = torch.from_numpy(sam_image).permute(2, 0, 1).float().unsqueeze(0).to(device)
+            
+            # 画像サイズ情報を保存
+            original_size = image_np.shape[:2]
+            input_size = sam_transform.get_preprocess_shape(original_size[0], original_size[1], 1024)
+            
+            # 推論
+            print("推論を実行しています...")
+            with torch.no_grad():
+                # Gemma3 + SAMモデルでの生成
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=256,
+                    do_sample=True,
+                    temperature=0.7,
+                    top_p=0.9,
+                    return_dict_in_generate=True,
+                    output_hidden_states=True,
+                )
+                
+            response = tokenizer.decode(outputs.sequences[0], skip_special_tokens=True)
+            print("\n--- 応答 ---")
+            print(response)
+            print("--- 応答終了 ---\n")
+            
+            # [SEG]トークンの有無を確認し、あればマスクを生成
+            seq = outputs.sequences[0]
+            seg_positions = (seq == seg_token_idx).nonzero(as_tuple=True)[0]
+            
+            if len(seg_positions) > 0:
+                print("[SEG]トークンが見つかりました。マスクを生成します。")
+                # 最後の層の隠れ状態を取得（各ステップごとのタプル）
+                # 各ステップは (batch_size, seq_len, hidden_dim)
+                # 最後のステップを取得
+                hidden_states = outputs.hidden_states[-1]  
+                
+                # [SEG]トークン位置の埋め込みを取得
+                seg_embedding = hidden_states[0, seg_positions[0]]
+                
+                # SAMの視覚エンコーダで画像埋め込みを取得
+                # モデルの視覚エンコーダを使用
+                image_embeddings = model.get_image_embeddings(sam_image_tensor)
+                
+                # [SEG]トークンの埋め込みをSAMの入力次元に射影
+                seg_embedding_projected = model.text_hidden_fcs[0](seg_embedding).unsqueeze(0).unsqueeze(1)  # [1, 1, 256]
+                
+                # プロンプトエンコーダを使用して埋め込みをSAMの入力形式に変換
+                sparse_embeddings, dense_embeddings = model.prompt_encoder(
+                    points=None,
+                    boxes=None,
+                    masks=None,
+                    text_embeds=seg_embedding_projected,
+                )
+                
+                # SAMのマスクデコーダを使用してマスクを生成
+                low_res_masks, _ = model.mask_decoder(
+                    image_embeddings=image_embeddings[0].unsqueeze(0),
+                    image_pe=model.prompt_encoder.get_dense_pe(),
+                    sparse_prompt_embeddings=sparse_embeddings,
+                    dense_prompt_embeddings=dense_embeddings,
+                    multimask_output=False,  # 単一マスクを出力
+                )
+                
+                # マスクを後処理して元の画像サイズに戻す
+                masks = model.postprocess_masks(
+                    low_res_masks,
+                    input_size=input_size,
+                    original_size=original_size,
+                )
+                
+                # シグモイド関数を適用してマスクを[0,1]の範囲に変換
+                mask = torch.sigmoid(masks[0, 0])
+                # 閾値を適用してバイナリマスクに変換
+                binary_mask = (mask > 0.5).float()
+                
+                # マスクを可視化して保存（オプション）
+                if args.save_mask:
+                    output_path = os.path.join(args.output_dir, f"{os.path.basename(args.image).split('.')[0]}_mask.png")
+                    visualize_and_save_mask(image_np, binary_mask, output_path)
+                else:
+                    visualize_and_save_mask(image_np, binary_mask)
+                
+            else:
+                print("[SEG]トークンが見つかりませんでした。マスクは生成されません。")
+            
+        else:
+            print(f"エラー: 画像 {args.image} が見つかりません")
+        
+        print("テストが正常に完了しました")
+        
+    except Exception as e:
+        print(f"エラーが発生しました: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
