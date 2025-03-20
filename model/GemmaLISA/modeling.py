@@ -377,6 +377,10 @@ class LISAForCausalLM(LISAPreTrainedModel):
         lisa_outputs = None
         sam_outputs = None
         
+        # masks_listが提供されており、masksがNoneの場合、masks_listをmasksとして使用
+        if masks is None and masks_list is not None:
+            masks = masks_list
+        
         # 画像の処理とLLMの入力準備
         if inputs_embeds is None and images is not None and input_ids is not None:
             # 画像の埋め込みを準備
@@ -473,7 +477,27 @@ class LISAForCausalLM(LISAPreTrainedModel):
         
         # マスク学習を行う場合の損失計算
         if masks is not None and sam_outputs is not None:
-            num_masks = masks.shape[1]
+            # masksがリスト型の場合はテンソルに変換
+            if isinstance(masks, list):
+                # リスト内の要素がテンソルかどうかをチェック
+                if all(isinstance(m, torch.Tensor) for m in masks):
+                    # すべてがテンソルの場合はスタック
+                    masks = torch.stack(masks)
+                else:
+                    # リスト内の要素にテンソル以外がある場合
+                    # 各要素をテンソルに変換してからスタック
+                    masks = torch.stack([m if isinstance(m, torch.Tensor) else torch.tensor(m, device=sam_outputs["masks"].device) for m in masks])
+            
+            # マスクの形状を調整（必要な場合）
+            if masks.shape != sam_outputs["masks"].shape:
+                # 予測と同じ形状になるように調整
+                if len(masks.shape) < len(sam_outputs["masks"].shape):
+                    # 次元を追加
+                    masks = masks.unsqueeze(1)
+                # デバイスを一致させる
+                masks = masks.to(sam_outputs["masks"].device)
+            
+            num_masks = masks.shape[1] if len(masks.shape) > 1 else 1
             mask_bce_loss = sigmoid_ce_loss(sam_outputs["masks"], masks, num_masks=num_masks)
             mask_dice_loss = dice_loss(sam_outputs["masks"], masks, num_masks=num_masks)
             mask_loss = mask_bce_loss + mask_dice_loss
