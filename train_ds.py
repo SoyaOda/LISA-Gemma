@@ -408,10 +408,15 @@ def main(args):
                           std=[0.26862954, 0.26130258, 0.27577711]),
             ])
             
-            val_dataset = ValDataset(
-                args.dataset_dir, tokenizer, args.version, val_dataset_str, args.image_size, transform=val_transform
-            )
-            logger.info(f"検証データセットのサイズ: {len(val_dataset)}")
+            # 一時的にコメントアウト - 評価データセットは現在Trainer APIと互換性がありません
+            # val_dataset = ValDataset(
+            #     args.dataset_dir, tokenizer, args.version, val_dataset_str, args.image_size, transform=val_transform
+            # )
+            # logger.info(f"検証データセットのサイズ: {len(val_dataset)}")
+            
+            # 評価データセットの問題を解決するまで一時的にNoneに設定
+            val_dataset = None
+            logger.warning("評価データセットが一時的に無効化されています。")
         else:
             val_dataset = None
             
@@ -436,8 +441,9 @@ def main(args):
             logging_steps=1,
             save_steps=args.steps_per_epoch // 2,
             save_total_limit=3,
-            evaluation_strategy="steps" if val_dataset is not None else "no",
-            eval_steps=args.steps_per_epoch // 2 if val_dataset is not None else None,
+            # 一時的に評価を無効化
+            evaluation_strategy="no",  # "steps" if val_dataset is not None else "no",
+            eval_steps=None,  # args.steps_per_epoch // 2 if val_dataset is not None else None,
             fp16=args.precision == "fp16",
             bf16=args.precision == "bf16",
             dataloader_num_workers=args.workers,

@@ -78,25 +78,99 @@ class GemmaLISATrainer(Trainer):
             return loss, outputs
         return loss
     
-    def _save_checkpoint(self, model, trial, metrics=None):
+    def _save_checkpoint(self, model, trial):
         """
         チェックポイントを保存する
         
         Args:
             model: 保存するモデル
             trial: Trialオブジェクト (HPO用)
-            metrics: 評価指標
         
         Returns:
             保存先のパス
         """
         # Trainer標準の保存処理を行う
-        output_dir = super()._save_checkpoint(model, trial, metrics)
+        output_dir = super()._save_checkpoint(model, trial)
         
         # ここでSAM関連の追加コンポーネントのセーブやその他のカスタム処理を行うことも可能
         # 例: text_hidden_fcs など追加モジュールの保存
         
         return output_dir
+    
+    def _save(self, output_dir, state_dict=None, save_model=True, safe_serialization=True):
+        """
+        モデルを保存する
+        
+        Args:
+            output_dir: 保存先ディレクトリ
+            state_dict: 保存する状態辞書
+            save_model: モデルを保存するかどうか
+            safe_serialization: safetensorsを使用するかどうか
+        """
+        # safetensorsの保存エラーを回避するため、safe_serializationを無効化
+        safe_serialization = False
+        
+        # ロギングレベルを一時的に変更して冗長な警告を抑制
+        import logging
+        import warnings
+        
+        # 元のロギングレベルを保存
+        original_level = logging.getLogger().level
+        original_transformers_level = logging.getLogger("transformers").level
+        
+        try:
+            # ロギングレベルをERRORに設定して警告を抑制
+            if safe_serialization:
+                logging.getLogger().setLevel(logging.ERROR)
+                logging.getLogger("transformers").setLevel(logging.ERROR)
+                
+                # safetensorsの警告を抑制
+                warnings.filterwarnings("ignore", message="Some tensors share memory")
+            
+            logger.info(f"モデルを保存します: {output_dir} (safe_serialization={safe_serialization})")
+            
+            # Transformersの新しいバージョンでは_saveメソッドの引数が異なる
+            if hasattr(super(), "_save") and callable(getattr(super(), "_save")):
+                # 親クラスの_saveメソッドのシグネチャを確認
+                import inspect
+                signature = inspect.signature(super()._save)
+                params = list(signature.parameters.keys())
+                
+                if len(params) >= 3 and "safe_serialization" in params:
+                    # 新しいバージョン: 4引数
+                    super()._save(output_dir, state_dict, save_model, safe_serialization)
+                elif len(params) >= 3 and "save_model" in params:
+                    # 中間バージョン: 3引数
+                    super()._save(output_dir, state_dict, save_model)
+                else:
+                    # 古いバージョン: 2引数
+                    super()._save(output_dir, state_dict)
+            else:
+                # 直接モデルを保存
+                if state_dict is None:
+                    state_dict = self.model.state_dict()
+                
+                if save_model:
+                    torch.save(state_dict, os.path.join(output_dir, "pytorch_model.bin"))
+                    self.model.config.save_pretrained(output_dir)
+        except RuntimeError as e:
+            # safetensorsエラーの場合、PyTorchの標準保存方法を使用（ログは最小限に）
+            if "Some tensors share memory" in str(e):
+                logger.info("safetensors形式での保存に失敗したため、PyTorch形式で保存します")
+                
+                if state_dict is None:
+                    state_dict = self.model.state_dict()
+                
+                torch.save(state_dict, os.path.join(output_dir, "pytorch_model.bin"))
+                self.model.config.save_pretrained(output_dir)
+            else:
+                # その他のエラーは再発生
+                raise e
+        finally:
+            # 元のロギングレベルを復元
+            logging.getLogger().setLevel(original_level)
+            logging.getLogger("transformers").setLevel(original_transformers_level)
+            warnings.resetwarnings()
     
     def create_optimizer(self):
         """
