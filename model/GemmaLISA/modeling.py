@@ -399,12 +399,6 @@ class LISAForCausalLM(LISAPreTrainedModel):
                 with torch.no_grad():
                     # SAMのイメージエンコーダで画像特徴を取得
                     sam_image_features = self.lisa.model.sam_model.image_encoder(images_sam)
-                    # SAMの予測器からプロンプトエンベッドを取得
-                    sparse_embeddings, dense_embeddings = self.lisa.model.sam_model.prompt_encoder(
-                        points=None,
-                        boxes=None,
-                        masks=None,
-                    )
             
             # フォワードパス実行
             lisa_outputs = self.language_model(
@@ -427,23 +421,38 @@ class LISAForCausalLM(LISAPreTrainedModel):
                 for b, s in seg_token_positions:
                     seg_hidden_states.append(last_hidden_state[b, s])
                 
-                # SAMマスクデコーダへ入力するための特徴量
+                # SEGトークンの埋め込みをスタックして変換用の入力形式に整形
                 seg_hidden_states = torch.stack(seg_hidden_states)
                 
+                # text_hidden_fcsが初期化されているか確認し、なければエラー
+                if self.lisa.model.text_hidden_fcs is None:
+                    raise ValueError("text_hidden_fcsが初期化されていません。initialize_lisa_modulesを呼び出してください。")
+                
+                # テキスト埋め込みをSAMプロンプト埋め込みに変換
+                seg_hidden_projected = self.lisa.model.text_hidden_fcs[0](seg_hidden_states)
+                # プロンプトエンコーダの入力形式に整形
+                text_embeds = seg_hidden_projected.unsqueeze(1)  # [N, 1, 256]
+                
+                # SAMのプロンプトエンコーダで処理
+                sparse_embeddings, dense_embeddings = self.lisa.model.sam_model.prompt_encoder(
+                    points=None,
+                    boxes=None,
+                    masks=None,
+                    text_embeds=text_embeds,
+                )
+                
                 # SAMのマスクデコーダで予測
-                mask_prediction = self.lisa.model.sam_model.mask_decoder(
+                masks, iou_predictions = self.lisa.model.sam_model.mask_decoder(
                     image_embeddings=sam_image_features,
                     image_pe=self.lisa.model.sam_model.prompt_encoder.get_dense_pe(),
                     sparse_prompt_embeddings=sparse_embeddings,
                     dense_prompt_embeddings=dense_embeddings,
                     multimask_output=False,
-                    hq_token_only=False,
-                    interm_embeddings=seg_hidden_states,
                 )
                 
                 sam_outputs = {
-                    "masks": mask_prediction.masks,
-                    "iou_predictions": mask_prediction.iou_prediction,
+                    "masks": masks,
+                    "iou_predictions": iou_predictions,
                 }
         else:
             # 通常の言語モデル処理

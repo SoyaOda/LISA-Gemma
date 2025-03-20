@@ -285,6 +285,10 @@ def main(args):
         device_info = next(model.parameters()).device
         logger.info(f"現在のモデルデバイス: {device_info}")
         
+        # LISA モジュールを初期化
+        logger.info("LISA モジュールを初期化しています...")
+        model.initialize_lisa_modules(args)
+        
         if not args.eval_only:
             # LoRAの設定
             lora_r = args.lora_r

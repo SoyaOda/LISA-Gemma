@@ -39,6 +39,7 @@ class GemmaLISAMetaModel(nn.Module):
         self.vision_model = vision_model
         self.lisa_model = lisa_model
         self.sam_model = sam_model
+        self.text_hidden_fcs = None  # テキスト埋め込みからSAMプロンプト埋め込みへの変換モジュール
     
     def get_vision_tower(self):
         """ビジョンタワーモデルを取得します"""
@@ -89,25 +90,80 @@ class GemmaLISAMetaModel(nn.Module):
             sam_checkpoint: SAMモデルのチェックポイントパス
             freeze_sam: SAMモデルをフリーズするかどうか
         """
-        # SAMモデルを初期化
+        # SAMモデルがまだ初期化されていない場合はここで初期化
         if self.sam_model is None and sam_checkpoint is not None:
-            # build_sam_vit_h関数を使用してSAMモデルを構築
-            self.sam_model = build_sam_vit_h(checkpoint=sam_checkpoint)
-            
-            # SAMモデルの学習設定
+            try:
+                # build_sam_vit_h関数を使ってSAMモデルを構築
+                self.sam_model = build_sam_vit_h(checkpoint=sam_checkpoint)
+            except Exception as e:
+                print(f"SAMモデルの初期化中にエラーが発生しました: {e}")
+        
+        # SAMモデルを凍結するかどうかの設定
+        if self.sam_model is not None:
             if freeze_sam:
-                # SAMモデルの全パラメータをフリーズ
+                # SAMモデルのパラメータを凍結
                 for param in self.sam_model.parameters():
                     param.requires_grad = False
             elif hasattr(model_args, "train_mask_decoder") and model_args.train_mask_decoder:
-                # マスクデコーダのみ学習可能に設定
+                # イメージエンコーダとプロンプトエンコーダを凍結し、マスクデコーダのみ訓練
                 for param in self.sam_model.image_encoder.parameters():
                     param.requires_grad = False
                 for param in self.sam_model.prompt_encoder.parameters():
                     param.requires_grad = False
-                self.sam_model.mask_decoder.train()
                 for param in self.sam_model.mask_decoder.parameters():
                     param.requires_grad = True
+        
+        # テキスト埋め込みからSAMプロンプト埋め込みへの変換モジュールを初期化
+        if hasattr(model_args, "out_dim") and model_args.out_dim is not None:
+            out_dim = model_args.out_dim
+        else:
+            out_dim = 256  # SAMのデフォルト次元
+        
+        # モデルの隠れ層のサイズを取得
+        if self.lisa_model is not None:
+            config = self.lisa_model.config
+            config_type = type(config).__name__
+            print(f"設定オブジェクトの型: {config_type}")
+            print(f"設定属性一覧: {dir(config)}")
+            
+            if hasattr(config, "text_config"):
+                # Gemma3Configの場合（マルチモーダル設定）
+                print(f"text_config属性一覧: {dir(config.text_config)}")
+                hidden_size = getattr(config.text_config, "hidden_size", 4096)
+                print(f"Gemma3Configからtext_config.hidden_size={hidden_size}を取得")
+            else:
+                # すでにGemma3TextConfigの場合（テキスト設定のみ）または他の構成
+                # model_dimを試す (Gemma3で使用される可能性のある名前)
+                if hasattr(config, "model_dim"):
+                    hidden_size = config.model_dim
+                    print(f"config.model_dim={hidden_size}を取得")
+                # hidden_sizeを試す
+                elif hasattr(config, "hidden_size"):
+                    hidden_size = config.hidden_size
+                    print(f"config.hidden_size={hidden_size}を取得")
+                # Gemma3固有の可能性がある他の属性を試す
+                elif hasattr(config, "hidden_dim"):
+                    hidden_size = config.hidden_dim
+                    print(f"config.hidden_dim={hidden_size}を取得")
+                # デフォルト値を使用
+                else:
+                    hidden_size = 4096
+                    print(f"属性が見つからないためデフォルト値({hidden_size})を使用")
+        else:
+            # lisa_modelがない場合はデフォルト値を使用
+            hidden_size = 4096  # Gemma3のデフォルト隠れ層サイズ
+            print(f"警告: lisa_modelが初期化されていません。デフォルトの隠れ層サイズ({hidden_size})を使用します。")
+        
+        # 変換モジュールの初期化
+        self.text_hidden_fcs = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden_size, hidden_size // 2),
+                nn.LayerNorm(hidden_size // 2),
+                nn.GELU(),
+                nn.Linear(hidden_size // 2, out_dim),
+                nn.LayerNorm(out_dim)
+            )
+        ])
     
     def forward(self, *args, **kwargs):
         """

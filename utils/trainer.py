@@ -34,6 +34,9 @@ class GemmaLISATrainer(Trainer):
         # 親クラスの初期化
         super().__init__(**kwargs)
         
+        # 混合精度トレーニング用のスケーラーを初期化
+        self.scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() and (self.args.fp16 or self.args.bf16) else None
+        
         # GPUデバイス情報のログ
         if torch.cuda.is_available():
             device_count = torch.cuda.device_count()
@@ -166,12 +169,13 @@ class GemmaLISATrainer(Trainer):
         
         return super().get_train_dataloader()
     
-    def log(self, logs: Dict[str, float]) -> None:
+    def log(self, logs: Dict[str, float], start_time=None) -> None:
         """
         ログを記録する
         
         Args:
             logs: ログデータ (辞書形式)
+            start_time: 開始時間（オプション）、親クラスとの互換性のため
         """
         # GCを実行してメモリリークを防止
         if self.args.local_rank <= 0 and self.state.global_step % 100 == 0:
@@ -180,7 +184,7 @@ class GemmaLISATrainer(Trainer):
                 torch.cuda.empty_cache()
         
         # 親クラスのログ処理
-        super().log(logs)
+        super().log(logs, start_time)
     
     def _get_checkpoint_path(self):
         """
@@ -246,7 +250,7 @@ class GemmaLISATrainer(Trainer):
         loss = outputs["loss"]
         
         # 損失のスケーリング（混合精度学習時）
-        if self.args.fp16 or self.args.bf16:
+        if (self.args.fp16 or self.args.bf16) and self.scaler is not None:
             self.scaler.scale(loss).backward()
             
             # 勾配クリッピング（CUDAが利用可能な場合のみ）
@@ -280,4 +284,7 @@ class GemmaLISATrainer(Trainer):
         if "mask_loss" in outputs and outputs["mask_loss"] is not None:
             logs["mask_loss"] = outputs["mask_loss"].detach().cpu().item()
         
-        return loss.detach(), logs 
+        # ログをTrainerクラスのログ機構に追加
+        self.log(logs)
+        
+        return loss.detach() 
