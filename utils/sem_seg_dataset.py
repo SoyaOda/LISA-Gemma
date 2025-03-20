@@ -336,6 +336,8 @@ class SemSegDataset(torch.utils.data.Dataset):
         num_classes_per_sample=3,
         exclude_val=False,
         sem_seg_data="ade20k||cocostuff",  # デフォルトではMapillaryを除外
+        debug_mode=False,  # デバッグモードフラグ
+        debug_samples=10,  # デバッグモードで使用するサンプル数
     ):
         """初期化
         
@@ -349,6 +351,8 @@ class SemSegDataset(torch.utils.data.Dataset):
             num_classes_per_sample: サンプルあたりのクラス数
             exclude_val: 検証データを除外するか
             sem_seg_data: セマンティックセグメンテーションデータ
+            debug_mode: デバッグモードかどうか
+            debug_samples: デバッグモードで使用するサンプル数
         """
         self.base_image_dir = base_image_dir
         self.tokenizer = tokenizer
@@ -358,6 +362,12 @@ class SemSegDataset(torch.utils.data.Dataset):
         self.samples_per_epoch = samples_per_epoch
         self.num_classes_per_sample = num_classes_per_sample
         self.exclude_val = exclude_val
+        self.debug_mode = debug_mode
+        self.debug_samples = debug_samples
+        
+        # デバッグモードのログ
+        if self.debug_mode:
+            print(f"SemSegDataset: デバッグモード有効 - 各データセットの最初の{self.debug_samples}例のみを使用")
         
         # データセットの初期化
         self.sem_seg_datas = sem_seg_data.split("||")
@@ -370,10 +380,24 @@ class SemSegDataset(torch.utils.data.Dataset):
             if ds == "ade20k":
                 ade_classes, ade_images, ade_labels = init_ade20k(base_image_dir)
                 self.data2classes[ds] = ade_classes
+                
+                # デバッグモードの場合は最初のdebug_samples個のサンプルのみを使用
+                if self.debug_mode:
+                    ade_images = ade_images[:self.debug_samples]
+                    ade_labels = ade_labels[:self.debug_samples] if ade_labels else None
+                    print(f"ADE20K: {len(ade_images)}例のみを使用")
+                
                 self.data2list[ds] = (ade_images, ade_labels)
             elif ds == "cocostuff":
                 cocostuff_classes, cocostuff_images, cocostuff_labels = init_cocostuff(base_image_dir)
                 self.data2classes[ds] = cocostuff_classes
+                
+                # デバッグモードの場合は最初のdebug_samples個のサンプルのみを使用
+                if self.debug_mode:
+                    cocostuff_images = cocostuff_images[:self.debug_samples]
+                    cocostuff_labels = cocostuff_labels[:self.debug_samples] if cocostuff_labels else None
+                    print(f"COCO-Stuff: {len(cocostuff_images)}例のみを使用")
+                
                 self.data2list[ds] = (cocostuff_images, cocostuff_labels)
                 
                 # クラス名からインデックスへのマッピングを作成（オリジナル実装と同様に）
@@ -383,14 +407,33 @@ class SemSegDataset(torch.utils.data.Dataset):
             elif ds == "mapillary":
                 mapillary_classes, mapillary_images, mapillary_labels = init_mapillary(base_image_dir)
                 self.data2classes[ds] = mapillary_classes
+                
+                # デバッグモードの場合は最初のdebug_samples個のサンプルのみを使用
+                if self.debug_mode:
+                    mapillary_images = mapillary_images[:self.debug_samples]
+                    mapillary_labels = mapillary_labels[:self.debug_samples] if mapillary_labels else None
+                    print(f"Mapillary: {len(mapillary_images)}例のみを使用")
+                
                 self.data2list[ds] = (mapillary_images, mapillary_labels)
             elif ds == "pascal_part":
                 pascal_classes, pascal_images = init_pascal_part(base_image_dir)
                 self.data2classes[ds] = pascal_classes
+                
+                # デバッグモードの場合は最初のdebug_samples個のサンプルのみを使用
+                if self.debug_mode:
+                    pascal_images = pascal_images[:self.debug_samples]
+                    print(f"Pascal Part: {len(pascal_images)}例のみを使用")
+                
                 self.data2list[ds] = (pascal_images, None)
             elif ds == "paco_lvis":
                 paco_classes, paco_images = init_paco(base_image_dir)
                 self.data2classes[ds] = paco_classes
+                
+                # デバッグモードの場合は最初のdebug_samples個のサンプルのみを使用
+                if self.debug_mode:
+                    paco_images = paco_images[:self.debug_samples]
+                    print(f"PACO LVIS: {len(paco_images)}例のみを使用")
+                
                 self.data2list[ds] = (paco_images, None)
         
         # Gemma3用の変換処理
@@ -524,6 +567,14 @@ class SemSegDataset(torch.utils.data.Dataset):
         template.system = SYSTEM_PROMPT
         template.messages = []
         
+        # 質問が空でないことを確認
+        if not question or question.strip() == "":
+            question = "What do you see in this image? Please output segmentation mask."
+        
+        # 回答が空でないことを確認
+        if not answer or answer.strip() == "":
+            answer = "I can see objects in the image. [SEG]."
+        
         # 画像トークンがすでに含まれているか確認
         if DEFAULT_IMAGE_TOKEN not in question:
             question = f"{DEFAULT_IMAGE_TOKEN}\n{question}"
@@ -537,8 +588,14 @@ class SemSegDataset(torch.utils.data.Dataset):
         
         template.append_message(template.roles[1], answer)
         
-        # プロンプトを取得
-        return template.get_prompt()
+        try:
+            # プロンプトを取得
+            prompt = template.get_prompt()
+            return prompt
+        except Exception as e:
+            print(f"会話テンプレート生成エラー: {e}")
+            # エラー時はフォールバックの会話を返す
+            return f"System: {SYSTEM_PROMPT}\n\nUser: {DEFAULT_IMAGE_TOKEN}\nWhat is in this image? Please output segmentation mask.\n\nAssistant: I can see objects in this image. [SEG]."
 
     def __getitem__(self, idx):
         """データセットからアイテムを取得"""

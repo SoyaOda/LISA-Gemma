@@ -97,9 +97,26 @@ class Conversation:
             return ret
         elif self.sep_style == SeparatorStyle.GEMMA:
             # Gemma3モデルの会話形式
+            from .constants import DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
+            
+            # システムプロンプトからスタート
             ret = "System: " + self.system
+            
+            # 各ターンの処理
             for i, (role, message) in enumerate(self.get_turns()):
+                # Gemma3互換の画像トークン処理
+                # DEFAULT_IMAGE_TOKENを<start_of_image>に置き換え
+                if DEFAULT_IMAGE_TOKEN in message:
+                    message = message.replace(DEFAULT_IMAGE_TOKEN, "<start_of_image>")
+                elif DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN in message:
+                    message = message.replace(
+                        DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN, 
+                        "<start_of_image>"
+                    )
+                
+                # ターンを追加
                 ret += "\n\n" + role + ": " + message
+            
             return ret
         else:
             raise ValueError(f"未知の区切りスタイル: {self.sep_style}")

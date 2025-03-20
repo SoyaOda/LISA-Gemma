@@ -60,21 +60,71 @@ from .vqa_dataset import VQADataset
 # DEFAULT_IM_END_TOKEN = "<im_end>"
 
 def tokenizer_image_token(text, tokenizer, return_tensors=None):
-    """テキスト内の画像トークンを処理し、トークナイズします"""
-    # 画像トークンをプレースホルダに置き換え
-    for img_token in [DEFAULT_IMAGE_TOKEN]:
-        if img_token in text:
-            text = text.replace(img_token, tokenizer.pad_token)
+    """テキスト内の画像トークンを処理し、Gemma3互換のトークナイズを行います"""
     
-    # トークナイズ
-    tokens = tokenizer(
-        text, 
-        return_tensors=return_tensors,
-        padding="longest"
-    ).input_ids
+    # Gemma3の画像トークンID（設定されている場合）を取得
+    image_token_id = None
+    if hasattr(tokenizer, "additional_special_tokens"):
+        for idx, token in enumerate(tokenizer.additional_special_tokens):
+            if token in [DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN, "<start_of_image>"]:
+                image_token_id = tokenizer.additional_special_tokens_ids[idx]
+                print(f"画像トークン '{token}' のIDを検出: {image_token_id}")
+                break
     
-    # 画像トークンのインデックスを置き換え
-    return tokens
+    # 画像トークンが見つからない場合の処理
+    if image_token_id is None:
+        # 回避策: <start_of_image>をボキャブラリに追加
+        print("警告: Gemma3画像トークンが見つかりません。<start_of_image>トークンを追加します")
+        image_token = "<start_of_image>"
+        num_added = tokenizer.add_tokens([image_token], special_tokens=True)
+        if num_added > 0:
+            image_token_id = tokenizer.convert_tokens_to_ids(image_token)
+            print(f"画像トークン '{image_token}' を追加しました。ID: {image_token_id}")
+        else:
+            # それでも失敗した場合はpad_tokenを使用
+            image_token_id = tokenizer.pad_token_id
+            print(f"警告: 画像トークンの追加に失敗しました。pad_token_id {image_token_id} を使用します")
+    
+    # 通常のテキストをトークナイズ
+    token_ids = []
+    
+    # まず、テキスト全体をトークナイズ
+    tokenized = tokenizer(text, return_tensors=return_tensors, add_special_tokens=False)
+    raw_ids = tokenized.input_ids[0] if return_tensors else tokenized.input_ids
+    
+    # 画像トークンが元のテキストに含まれているか確認
+    contains_image_token = DEFAULT_IMAGE_TOKEN in text or (
+        DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN) in text
+    
+    if contains_image_token:
+        # テキスト内の画像トークンを適切なGemma3画像トークンIDに置き換える
+        # Gemma3は画像トークンの存在を検出するために、特定のIDが必要
+        if return_tensors:
+            # テンソル形式の場合は特殊トークンIDをテンソルに挿入
+            modified_ids = []
+            for id_tensor in raw_ids:
+                # デフォルトの画像トークンをGemma3の画像トークンIDに置き換え
+                if (DEFAULT_IMAGE_TOKEN in text) and (id_tensor == tokenizer.pad_token_id):
+                    modified_ids.append(image_token_id)
+                else:
+                    modified_ids.append(id_tensor.item())
+            token_ids = torch.tensor([modified_ids], dtype=torch.long)
+        else:
+            # 通常のIDリストを生成
+            for i, text_chunk in enumerate(text.split(DEFAULT_IMAGE_TOKEN)):
+                # テキストチャンクをトークナイズ
+                if i > 0:
+                    # 画像トークンを挿入
+                    token_ids.append(image_token_id)
+                
+                # テキストチャンクのトークンを追加
+                chunk_ids = tokenizer(text_chunk, add_special_tokens=False).input_ids
+                token_ids.extend(chunk_ids)
+    else:
+        # 画像トークンが含まれていない場合は、通常通りトークナイズ
+        token_ids = raw_ids
+    
+    return token_ids
 
 def collate_fn(
     batch, tokenizer=None, conv_type="gemma_v1", use_mm_start_end=True, local_rank=-1
@@ -93,18 +143,62 @@ def collate_fn(
     cnt = 0
     inferences = []
     
-    for (
-        image_path,
-        images,
-        images_gemma,
-        conversations,
-        masks,
-        label,
-        resize,
-        questions,
-        sampled_classes,
-        inference,
-    ) in batch:
+    # バッチ内の各アイテムから値を取り出し適切なリストに追加
+    for item in batch:
+        # バッチアイテムの長さを確認して適切にアンパック
+        if len(item) == 11:
+            # 11個の値を返すデータセット用
+            (
+                image_path,
+                images,
+                images_gemma,
+                conversations,
+                masks,
+                label,
+                resize,
+                questions,
+                sampled_classes,
+                inference,
+                extra_value,  # 11番目の値は無視
+            ) = item
+        elif len(item) == 10:
+            # 元のLISAと同じフォーマット (10個の値)
+            (
+                image_path,
+                images,
+                images_gemma,
+                conversations,
+                masks,
+                label,
+                resize,
+                questions,
+                sampled_classes,
+                inference,
+            ) = item
+        elif len(item) == 9:
+            # 9個の値だけ返す一部のデータセット用
+            (
+                image_path,
+                images,
+                images_gemma,
+                conversations,
+                masks,
+                label,
+                resize,
+                questions,
+                sampled_classes,
+            ) = item
+            inference = False  # デフォルト値
+        else:
+            print(f"警告: 予期しないアイテム形式です (長さ {len(item)})")
+            continue
+        
+        # 会話リストが空または無効な場合はスキップ
+        if not conversations or len(conversations) == 0:
+            print(f"警告: 空の会話リストです。このバッチアイテムをスキップします。")
+            continue
+        
+        # 各値を適切なリストに格納
         image_path_list.append(image_path)
         images_list.append(images)
         images_gemma_list.append(images_gemma)
@@ -117,6 +211,27 @@ def collate_fn(
         cnt += len(conversations)
         offset_list.append(cnt)
         inferences.append(inference)
+    
+    # すべてのアイテムがスキップされた場合は空のバッチを返す
+    if len(conversation_list) == 0:
+        print("警告: 有効な会話データがないため、空のバッチを返します")
+        # 最小限の辞書を返す
+        return {
+            "image_paths": [],
+            "images": torch.zeros(0, 3, 1024, 1024),
+            "pixel_values": torch.zeros(0, 3, 224, 224),
+            "input_ids": torch.zeros(0, 1, dtype=torch.long),
+            "labels": torch.zeros(0, 1, dtype=torch.long),
+            "attention_masks": torch.zeros(0, 1, dtype=torch.bool),
+            "masks_list": [],
+            "label_list": [],
+            "resize_list": [],
+            "offset": torch.LongTensor([0, 0]),
+            "questions_list": [],
+            "sampled_classes_list": [],
+            "inference": False,
+            "conversation_list": [],
+        }
 
     # 画像トークンの置き換え処理
     if use_mm_start_end:
@@ -127,26 +242,63 @@ def collate_fn(
     
     # テキストのトークナイズ
     input_ids = []
-    max_length = 0
     
     # まず各会話をトークナイズして最大長を確認
     conversation_tokens = []
-    for prompt in conversation_list:
+    
+    if tokenizer is None:
+        print("警告: トークナイザーがNoneです。処理をスキップします。")
+        return {
+            "image_paths": image_path_list,
+            "images": torch.zeros(1, 3, 1024, 1024),
+            "pixel_values": torch.zeros(1, 3, 224, 224),
+            "input_ids": torch.zeros(1, 1, dtype=torch.long),
+            "labels": torch.zeros(1, 1, dtype=torch.long),
+            "attention_masks": torch.zeros(1, 1, dtype=torch.bool),
+            "masks_list": masks_list,
+            "label_list": label_list,
+            "resize_list": resize_list,
+            "offset": torch.LongTensor(offset_list),
+            "questions_list": questions_list,
+            "sampled_classes_list": sampled_classes_list,
+            "inference": inferences[0] if inferences else False,
+            "conversation_list": conversation_list,
+        }
+    
+    # 各会話をトークン化
+    for i, prompt in enumerate(conversation_list):
         try:
             # トークナイズ（テンソル変換なし）
             tokens = tokenizer_image_token(prompt, tokenizer, return_tensors=None)
             conversation_tokens.append(tokens)
-            
-            # 最大長を更新
-            if len(tokens) > max_length:
-                max_length = len(tokens)
         except Exception as e:
-            print(f"トークナイズエラー: {e}")
-            # エラー発生時は空のトークン列を使用
-            empty_tokens = tokenizer("", return_tensors=None).input_ids
-            conversation_tokens.append(empty_tokens)
+            print(f"トークナイズエラー（会話 {i}）: {e}, プロンプト: {prompt[:50]}...")
+            # エラー時はデフォルトのトークンを使用
+            conversation_tokens.append([tokenizer.bos_token_id] if tokenizer.bos_token_id else [0])
     
-    # 各会話をPyTorchテンソルに変換して最大長に統一
+    # トークンが得られなかった場合のフォールバック
+    if not conversation_tokens:
+        print("警告: 有効なトークンが作成できませんでした。デフォルト値を使用します。")
+        # 最小限の辞書を返す
+        return {
+            "image_paths": image_path_list,
+            "images": torch.stack(images_list) if images_list else torch.zeros(1, 3, 1024, 1024),
+            "pixel_values": torch.stack(images_gemma_list) if images_gemma_list else torch.zeros(1, 3, 224, 224),
+            "input_ids": torch.zeros(1, 1, dtype=torch.long),
+            "labels": torch.zeros(1, 1, dtype=torch.long),
+            "attention_masks": torch.zeros(1, 1, dtype=torch.bool),
+            "masks_list": masks_list,
+            "label_list": label_list,
+            "resize_list": resize_list,
+            "offset": torch.LongTensor(offset_list),
+            "questions_list": questions_list,
+            "sampled_classes_list": sampled_classes_list,
+            "inference": inferences[0] if inferences else False,
+            "conversation_list": conversation_list,
+        }
+    
+    # 各会話をPyTorchテンソルに変換
+    max_length = max(len(tokens) for tokens in conversation_tokens)
     for tokens in conversation_tokens:
         # トークンをテンソルに変換
         token_tensor = torch.tensor(tokens, dtype=torch.long)
@@ -159,18 +311,32 @@ def collate_fn(
         )
     except RuntimeError as e:
         print(f"パディングエラー: {e}")
-        # 緊急措置: 手動でパディングを適用
+        # 手動でパディングを適用
         padded_ids = []
         for ids in input_ids:
             if len(ids) < max_length:
-                padding = torch.full((max_length - len(ids),), tokenizer.pad_token_id, dtype=torch.long)
+                padding = torch.full(
+                    (max_length - len(ids),), 
+                    tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0, 
+                    dtype=torch.long
+                )
                 padded = torch.cat([ids, padding], dim=0)
             else:
                 padded = ids[:max_length]  # 切り詰め
             padded_ids.append(padded)
-        input_ids = torch.stack(padded_ids, dim=0)
+        
+        if padded_ids:
+            input_ids = torch.stack(padded_ids, dim=0)
+        else:
+            # 空のリストの場合のフォールバック
+            input_ids = torch.zeros(1, 1, dtype=torch.long)
     
-    attention_masks = input_ids.ne(tokenizer.pad_token_id)
+    # この時点でinput_idsが有効かチェック
+    if input_ids.numel() == 0:
+        print("警告: input_idsが空です。デフォルト値を使用します。")
+        input_ids = torch.zeros(1, 1, dtype=torch.long)
+    
+    attention_masks = input_ids.ne(tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0)
 
     # ターゲットラベルの作成
     targets = input_ids.clone()
@@ -183,7 +349,7 @@ def collate_fn(
         sep = "[/INST] "
     
     for conversation, target in zip(conversation_list, targets):
-        total_len = int(target.ne(tokenizer.pad_token_id).sum())
+        total_len = int(target.ne(tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0).sum())
         
         # システムプロンプト部分とユーザークエリ部分はIGNORE_INDEXに設定
         # Gemma3の会話形式に応じて調整
@@ -191,24 +357,25 @@ def collate_fn(
         user_assistant_sep = sep
         system_user_sep = "\n\nUser: "
         
-        if system_user_sep in conversation and user_assistant_sep in conversation:
-            # システムプロンプトの開始からアシスタント応答の開始までをIGNORE_INDEXに
-            system_start = 0
-            user_start = conversation.find(system_user_sep) + len(system_user_sep)
-            assistant_start = conversation.find(user_assistant_sep) + len(user_assistant_sep)
-            
-            # トークン位置に変換
-            user_token_start = len(tokenizer(conversation[:user_start]).input_ids) - 1
-            assistant_token_start = len(tokenizer(conversation[:assistant_start]).input_ids) - 1
-            
-            # システム・ユーザー部分はIGNORE_INDEXに設定
-            target[:assistant_token_start] = IGNORE_INDEX
+        try:
+            if system_user_sep in conversation and user_assistant_sep in conversation:
+                # システムプロンプトの開始からアシスタント応答の開始までをIGNORE_INDEXに
+                assistant_start = conversation.find(user_assistant_sep) + len(user_assistant_sep)
+                
+                # トークン位置に変換
+                assistant_token_start = len(tokenizer(conversation[:assistant_start], add_special_tokens=False).input_ids)
+                
+                # システム・ユーザー部分はIGNORE_INDEXに設定
+                if assistant_token_start < len(target):
+                    target[:assistant_token_start] = IGNORE_INDEX
+        except Exception as e:
+            print(f"ラベル処理エラー: {e}")
         
         # パディング部分もIGNORE_INDEXに設定
         target[total_len:] = IGNORE_INDEX
     
     # 長いシーケンスのトランケーション
-    if inferences[0] == False:
+    if all(not inf for inf in inferences):
         truncate_len = tokenizer.model_max_length - 255  # 画像トークン用の余裕
 
         if input_ids.shape[1] > truncate_len:
@@ -285,7 +452,7 @@ def collate_fn(
         "offset": torch.LongTensor(offset_list),
         "questions_list": questions_list,
         "sampled_classes_list": sampled_classes_list,
-        "inference": inferences[0],
+        "inference": inferences[0] if inferences else False,
         "conversation_list": conversation_list,
     }
 
@@ -299,9 +466,11 @@ class HybridDataset(torch.utils.data.Dataset):
 
     def __init__(
         self,
-        base_image_dir,
-        tokenizer,
-        model_name,  # Gemma3モデル名を指定
+        args=None,  # argsオブジェクトまたは個別のパラメータで設定可能
+        base_image_dir=None,
+        tokenizer=None,
+        model_name=None,  # Gemma3モデル名を指定
+        vision_tower=None,  # 後方互換性のため
         samples_per_epoch=500 * 8 * 2 * 10,
         precision: str = "fp32",
         image_size: int = 224,
@@ -314,51 +483,76 @@ class HybridDataset(torch.utils.data.Dataset):
         vqa_data="llava_instruct_150k",
         reason_seg_data="ReasonSeg|train",
         explanatory=0.1,
+        debug_mode=False,  # デバッグモードフラグ
+        debug_samples=10,  # デバッグモードで使用するサンプル数
+        transform=None,  # カスタム変換を許可
     ):
-        self.exclude_val = exclude_val
+        # argsオブジェクトが渡された場合はそこから値を抽出
+        if args is not None:
+            self.base_image_dir = args.dataset_dir if hasattr(args, 'dataset_dir') else base_image_dir
+            self.tokenizer = tokenizer
+            self.precision = args.precision if hasattr(args, 'precision') else precision
+            self.samples_per_epoch = args.steps_per_epoch * args.batch_size * args.grad_accumulation_steps if hasattr(args, 'steps_per_epoch') else samples_per_epoch
+            self.image_size = args.image_size if hasattr(args, 'image_size') else image_size
+            self.num_classes_per_sample = args.num_classes_per_sample if hasattr(args, 'num_classes_per_sample') else num_classes_per_sample
+            self.exclude_val = args.exclude_val if hasattr(args, 'exclude_val') else exclude_val
+            dataset = args.dataset if hasattr(args, 'dataset') else dataset
+            sample_rate = list(map(int, args.sample_rates.split(','))) if hasattr(args, 'sample_rates') else sample_rate
+            sem_seg_data = args.sem_seg_data if hasattr(args, 'sem_seg_data') else sem_seg_data
+            refer_seg_data = args.refer_seg_data if hasattr(args, 'refer_seg_data') else refer_seg_data
+            vqa_data = args.vqa_data if hasattr(args, 'vqa_data') else vqa_data
+            reason_seg_data = args.reason_seg_data if hasattr(args, 'reason_seg_data') else reason_seg_data
+            self.explanatory = args.explanatory if hasattr(args, 'explanatory') else explanatory
+            model_name = args.version if hasattr(args, 'version') else model_name
+            debug_mode = args.debug if hasattr(args, 'debug') else debug_mode
+            debug_samples = args.debug_samples if hasattr(args, 'debug_samples') else debug_samples
+            self.transform = args.transform if hasattr(args, 'transform') else transform
+        else:
+            self.base_image_dir = base_image_dir
+            self.tokenizer = tokenizer
+            self.precision = precision
+            self.samples_per_epoch = samples_per_epoch
+            self.image_size = image_size
+            self.num_classes_per_sample = num_classes_per_sample
+            self.exclude_val = exclude_val
+            self.explanatory = explanatory
+            self.transform = transform
+
+        # デバッグモードのログ
+        if debug_mode:
+            print(f"==== デバッグモード有効: 各データセットの最初の{debug_samples}例のみを使用 ====")
+        
         self.dataset = dataset
-        self.samples_per_epoch = samples_per_epoch
-        self.explanatory = explanatory
-        self.num_classes_per_sample = num_classes_per_sample
         sample_rate = np.array(sample_rate)
         self.sample_rate = sample_rate / sample_rate.sum()
-
-        self.base_image_dir = base_image_dir
-        self.image_size = image_size
-        self.tokenizer = tokenizer
-        self.precision = precision
         
         # Gemma3のプロセッサを初期化
         self.processor = None
         self.image_processor = None
         
         try:
-            # 直接transformersからAutoProcessorを使用
-            from transformers import AutoProcessor, AutoImageProcessor
+            # モデル名からプロセッサを取得
+            from transformers import AutoProcessor
+            self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
             
-            # trust_remote_code=Trueを指定してプロセッサを取得
-            self.processor = AutoProcessor.from_pretrained(
-                model_name, 
-                trust_remote_code=True
-            )
-            
-            # 改善されたGemmaImageProcessorを使用
-            from model.gemma3.mm_utils import GemmaImageProcessor
-            self.image_processor = GemmaImageProcessor(self.processor)
-            
-            # バックアップとしてCLIPのイメージプロセッサも取得
-            self.image_processor_fallback = AutoImageProcessor.from_pretrained(
-                "openai/clip-vit-large-patch14",
-                trust_remote_code=True
-            )
-            
-            print(f"Gemma3プロセッサを初期化: {model_name}")
+            # Gemma3の画像処理ユーティリティを使用（インポートできる場合）
+            try:
+                from model.gemma3.mm_utils import GemmaImageProcessor
+                self.image_processor = GemmaImageProcessor(self.processor)
+            except ImportError:
+                # フォールバック: 標準的なプロセッサを使用
+                self.image_processor = self.processor.image_processor
+                
         except Exception as e:
             print(f"プロセッサの初期化エラー: {e}")
+            # フォールバック: 標準的な前処理を使用
+            self.processor = None
+            self.image_processor = None
             print("警告: 標準的な画像前処理を使用します")
         
         # SAM用の画像処理
-        self.transform = ResizeLongestSide(self.img_size)
+        self.sam_transform = ResizeLongestSide(self.img_size)
+        # ここではself.transformを上書きしない - Gemma3用のカスタム変換として維持
 
         self.datasets = dataset.split("||")
 
@@ -367,58 +561,60 @@ class HybridDataset(torch.utils.data.Dataset):
             if dataset == "sem_seg":
                 self.all_datasets.append(
                     SemSegDataset(
-                        base_image_dir,
-                        tokenizer,
-                        model_name,  # vision_towerの代わりにmodel_nameを渡す
-                        samples_per_epoch,
-                        precision,
-                        image_size,
-                        num_classes_per_sample,
-                        exclude_val,
-                        sem_seg_data,
+                        base_image_dir=self.base_image_dir,
+                        tokenizer=self.tokenizer,
+                        model_name=model_name,  # vision_towerの代わりにmodel_nameを渡す
+                        samples_per_epoch=self.samples_per_epoch,
+                        precision=self.precision,
+                        image_size=self.image_size,
+                        num_classes_per_sample=self.num_classes_per_sample,
+                        exclude_val=self.exclude_val,
+                        sem_seg_data=sem_seg_data,
+                        debug_mode=debug_mode,  # デバッグモードのフラグを渡す
+                        debug_samples=debug_samples,  # デバッグサンプル数を渡す
                     )
                 )
             elif dataset == "refer_seg":
                 self.all_datasets.append(
                     ReferSegDataset(
-                        base_image_dir,
-                        tokenizer,
-                        model_name,
-                        samples_per_epoch,
-                        precision,
-                        image_size,
-                        num_classes_per_sample,
-                        exclude_val,
-                        refer_seg_data,
+                        base_image_dir=self.base_image_dir,
+                        tokenizer=self.tokenizer,
+                        model_name=model_name,
+                        samples_per_epoch=self.samples_per_epoch,
+                        precision=self.precision,
+                        image_size=self.image_size,
+                        num_classes_per_sample=self.num_classes_per_sample,
+                        exclude_val=self.exclude_val,
+                        refer_seg_data=refer_seg_data,
                     )
                 )
             elif dataset == "vqa":
                 self.all_datasets.append(
                     VQADataset(
-                        base_image_dir,
-                        tokenizer,
-                        model_name,
-                        samples_per_epoch,
-                        precision,
-                        image_size,
-                        num_classes_per_sample,
-                        exclude_val,
-                        vqa_data,
+                        base_image_dir=self.base_image_dir,
+                        tokenizer=self.tokenizer,
+                        model_name=model_name,
+                        samples_per_epoch=self.samples_per_epoch,
+                        precision=self.precision,
+                        image_size=self.image_size,
+                        num_classes_per_sample=self.num_classes_per_sample,
+                        exclude_val=self.exclude_val,
+                        vqa_data=vqa_data,
                     )
                 )
             elif dataset == "reason_seg":
                 self.all_datasets.append(
                     ReasonSegDataset(
-                        base_image_dir,
-                        tokenizer,
-                        model_name,
-                        samples_per_epoch,
-                        precision,
-                        image_size,
-                        num_classes_per_sample,
-                        exclude_val,
-                        reason_seg_data,
-                        explanatory,
+                        base_image_dir=self.base_image_dir,
+                        tokenizer=self.tokenizer,
+                        model_name=model_name,
+                        samples_per_epoch=self.samples_per_epoch,
+                        precision=self.precision,
+                        image_size=self.image_size,
+                        num_classes_per_sample=self.num_classes_per_sample,
+                        exclude_val=self.exclude_val,
+                        reason_seg_data=reason_seg_data,
+                        explanatory=self.explanatory,
                     )
                 )
 
@@ -429,8 +625,43 @@ class HybridDataset(torch.utils.data.Dataset):
         # ランダムにサブデータセットを選択
         ind = np.random.choice(list(range(len(self.datasets))), p=self.sample_rate)
         data = self.all_datasets[ind]
+        
+        # データセットからデータを取得
+        batch_data = data[0]
+        
+        # 画像変換処理
+        if len(batch_data) >= 2:
+            original_image = batch_data[1]  # 画像データは通常2番目の要素
+            
+            # 1. SAM用の高解像度画像変換 (常に適用)
+            if isinstance(original_image, torch.Tensor):
+                # テンソルをnumpyに変換 (C,H,W) -> (H,W,C)
+                image_numpy = original_image.permute(1, 2, 0).numpy()
+                
+                # SAM変換を適用
+                sam_image = self.sam_transform.apply_image(image_numpy)
+                sam_tensor = torch.from_numpy(sam_image).permute(2, 0, 1).contiguous()
+                
+                # 2. Gemma3用の変換 (設定されている場合のみ適用)
+                if self.transform is not None:
+                    # Gemma用の変換を適用
+                    gemma_tensor = self.transform(image_numpy)
+                    
+                    # バッチデータの更新 (SAM用とGemma用の両方を設定)
+                    batch_data = list(batch_data)
+                    batch_data[1] = sam_tensor  # SAM用
+                    # 3番目の要素がGemma用の画像データであると仮定
+                    if len(batch_data) > 2:
+                        batch_data[2] = gemma_tensor  # Gemma用
+                    batch_data = tuple(batch_data)
+        
         inference = False
-        return *data[0], inference
+        
+        # バッチデータとinferenceフラグを返す
+        if isinstance(batch_data, tuple):
+            return *batch_data, inference
+        else:
+            return batch_data, inference
 
 
 class ValDataset(torch.utils.data.Dataset):
@@ -447,8 +678,19 @@ class ValDataset(torch.utils.data.Dataset):
         model_name,  # Gemma3モデル名
         val_dataset,
         image_size=1024,
+        transform=None,  # カスタム変換を許可
     ):
         self.base_image_dir = base_image_dir
+        self.transform = transform  # Gemma3用のカスタム変換を保存
+        self.sam_transform = ResizeLongestSide(image_size)  # SAM用の変換
+        self.image_processor = None  # 互換性のために追加
+        self.image_size = image_size  # 画像サイズを保存
+        self.tokenizer = tokenizer
+        
+        # val_datasetが文字列であることを確認
+        if not isinstance(val_dataset, str):
+            raise ValueError(f"val_datasetは文字列でなければなりません。現在の型: {type(val_dataset)}")
+        
         splits = val_dataset.split("|")
         if len(splits) == 2:
             ds, split = splits
@@ -494,13 +736,23 @@ class ValDataset(torch.utils.data.Dataset):
         self.ds = ds
         self.image_size = image_size
         self.tokenizer = tokenizer
-        self.transform = ResizeLongestSide(image_size)
+        self.sam_transform = ResizeLongestSide(image_size)  # SAM用の変換
+        # self.transformはGemma3用のカスタム変換として維持
         
         # Gemma3のプロセッサを初期化
         try:
             # モデル名からプロセッサを取得
-            self.processor = get_gemma_processor(model_name)
-            self.image_processor = GemmaImageProcessor(self.processor)
+            from transformers import AutoProcessor
+            self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+            
+            # Gemma3の画像処理ユーティリティを使用（インポートできる場合）
+            try:
+                from model.gemma3.mm_utils import GemmaImageProcessor
+                self.image_processor = GemmaImageProcessor(self.processor)
+            except ImportError:
+                # フォールバック: 標準的なプロセッサを使用
+                self.image_processor = self.processor.image_processor
+                
         except Exception as e:
             print(f"プロセッサの初期化エラー: {e}")
             # フォールバック: 標準的な前処理を使用
@@ -562,6 +814,27 @@ class ValDataset(torch.utils.data.Dataset):
             mask_json, sampled_sents, is_sentence = get_mask_from_json(json_path, image)
             sampled_sents = [sampled_sents[0]]
 
+        # 画像の前処理
+        # 1. SAM用の高解像度画像変換
+        image_sam_np = self.sam_transform.apply_image(image)
+        image_sam = self.preprocess(torch.from_numpy(image_sam_np).permute(2, 0, 1).contiguous())
+        
+        # 2. Gemma3用の画像変換
+        if self.transform is not None:
+            # Gemma3用のカスタム変換がある場合はそれを使用
+            images_gemma = self.transform(image)
+            print(f"Gemma3用カスタム変換後の画像サイズ: {images_gemma.shape}")
+        else:
+            # 標準的なリサイズと正規化
+            h, w = image.shape[:2]
+            size = 896  # Gemma3の推奨サイズ
+            image_gemma = cv2.resize(image, (size, size), interpolation=cv2.INTER_CUBIC)
+            image_gemma = torch.from_numpy(image_gemma).permute(2, 0, 1).float() / 255.0
+            # 標準的な正規化値を適用
+            mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(-1, 1, 1)
+            std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(-1, 1, 1)
+            images_gemma = (image_gemma - mean) / std
+            
         # Gemma3用の会話形式を作成
         conversations = []
         template = get_default_conv_template("gemma_v1")  # Gemma3用テンプレート
@@ -588,25 +861,10 @@ class ValDataset(torch.utils.data.Dataset):
             conversations.append(template.get_prompt())
             i += 1
 
-        # Gemma3用の画像処理
-        if self.image_processor is not None:
-            # Gemma3の視覚モデル用の前処理
-            images_gemma = self.image_processor(image)
-        else:
-            # フォールバック処理: 標準的なリサイズと正規化
-            h, w = image.shape[:2]
-            size = self.image_size
-            image_gemma = cv2.resize(image, (size, size), interpolation=cv2.INTER_CUBIC)
-            image_gemma = torch.from_numpy(image_gemma).permute(2, 0, 1).float() / 255.0
-            # 標準的な正規化値を適用
-            mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(-1, 1, 1)
-            std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(-1, 1, 1)
-            images_gemma = (image_gemma - mean) / std
-
-        # SAM用の高解像度画像処理
-        image_sam = self.transform.apply_image(image)
-        resize = image_sam.shape[:2]
-        image_sam = self.preprocess(torch.from_numpy(image_sam).permute(2, 0, 1).contiguous())
+        # SAM用の高解像度画像処理（常に従来の処理方法を使用）
+        # SAMモデルには一定の入力形式が必要なため、カスタム変換は適用しない
+        image_sam = self.preprocess(torch.from_numpy(image_sam_np).permute(2, 0, 1).contiguous())
+        resize = image.shape[:2]  # 元画像のサイズ情報を保持
 
         # マスクの処理
         if self.data_type == "refer_seg":

@@ -151,13 +151,23 @@ class ProgressMeter(object):
 
 
 def dict_to_cuda(input_dict):
-    for k, v in input_dict.items():
-        if isinstance(input_dict[k], torch.Tensor):
-            input_dict[k] = v.cuda(non_blocking=True)
-        elif (
-            isinstance(input_dict[k], list)
-            and len(input_dict[k]) > 0
-            and isinstance(input_dict[k][0], torch.Tensor)
-        ):
-            input_dict[k] = [ele.cuda(non_blocking=True) for ele in v]
+    """入力辞書内のテンソルをCUDAに転送する（CUDAが利用可能な場合のみ）
+    
+    Args:
+        input_dict: テンソルを含む辞書
+        
+    Returns:
+        テンソルがCUDAに転送された辞書（CUDAが利用可能な場合）
+    """
+    # CUDAが利用可能かチェック
+    if torch.cuda.is_available():
+        for k, v in input_dict.items():
+            if isinstance(input_dict[k], torch.Tensor):
+                input_dict[k] = v.cuda(non_blocking=True)
+            elif (
+                isinstance(input_dict[k], list)
+                and len(input_dict[k]) > 0
+                and isinstance(input_dict[k][0], torch.Tensor)
+            ):
+                input_dict[k] = [ele.cuda(non_blocking=True) for ele in v]
     return input_dict

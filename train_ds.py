@@ -4,22 +4,63 @@ import shutil
 import sys
 import time
 from functools import partial
+import logging
 
-import deepspeed
+try:
+    import deepspeed
+    DEEPSPEED_AVAILABLE = True
+except ImportError:
+    DEEPSPEED_AVAILABLE = False
+
 import numpy as np
 import torch
 import tqdm
 import transformers
 from peft import LoraConfig, get_peft_model
 from torch.utils.tensorboard import SummaryWriter
-from transformers import AutoProcessor
+from transformers import (
+    AutoProcessor, 
+    AutoTokenizer, 
+    TrainingArguments, 
+    default_data_collator,
+    set_seed
+)
 
-from model.GemmaLISA import GemmaLISAForCausalLM, LISAForCausalLM
+from model import LISAForCausalLM
 from utils.dataset import HybridDataset, ValDataset, collate_fn
-from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
-                         AverageMeter, ProgressMeter, Summary, dict_to_cuda,
-                         intersectionAndUnionGPU)
+from utils.trainer import GemmaLISATrainer
+from utils.utils import (
+    DEFAULT_IM_END_TOKEN, 
+    DEFAULT_IM_START_TOKEN,
+    DEFAULT_IMAGE_TOKEN,
+    AverageMeter, 
+    ProgressMeter, 
+    Summary, 
+    dict_to_cuda,
+    intersectionAndUnionGPU
+)
 
+from torchvision.transforms import Compose, ToTensor, RandomResizedCrop, Normalize, InterpolationMode
+
+# 初期化メッセージとログ設定
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
+
+# GPU/CPU環境の確認
+if torch.cuda.is_available():
+    device_count = torch.cuda.device_count()
+    device_names = [torch.cuda.get_device_name(i) for i in range(device_count)]
+    logger.info(f"=== GPU環境で実行: 利用可能なGPU {device_count}台 ===")
+    for i, name in enumerate(device_names):
+        logger.info(f"GPU {i}: {name}")
+    logger.info(f"CUDA バージョン: {torch.version.cuda}")
+else:
+    logger.info("=== CPU環境で実行: GPUが利用できません ===")
+    logger.info(f"PyTorch バージョン: {torch.__version__}")
 
 def parse_args(args):
     parser = argparse.ArgumentParser(description="LISA-Gemma3 Model Training")
@@ -103,6 +144,14 @@ def parse_args(args):
     )
     parser.add_argument("--deepspeed_config", default="ds_config.json", type=str)
     
+    # デバッグ・テストモード用のオプションを追加
+    parser.add_argument("--debug", action="store_true", default=False, 
+                      help="デバッグモード：ADE20kの最初の10例のみを使用")
+    parser.add_argument("--debug_samples", type=int, default=10,
+                      help="デバッグモードで使用するサンプル数（デフォルト: 10）")
+    parser.add_argument("--debug_dataset", type=str, default="ade20k",
+                      help="デバッグモードで使用するデータセット（デフォルト: ade20k）")
+    
     return parser.parse_args(args)
 
 
@@ -115,9 +164,35 @@ def main(args):
     else:
         writer = None
 
-    # Create model
-    print(f"モデル名: {args.version}")
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
+    # シード値を設定して再現性を確保
+    set_seed(42)
+    
+    # デバイス情報の詳細表示
+    logger.info("=== トレーニング環境詳細 ===")
+    if torch.cuda.is_available():
+        current_device = torch.cuda.current_device()
+        logger.info(f"現在のアクティブデバイス: GPU {current_device} ({torch.cuda.get_device_name(current_device)})")
+        logger.info(f"GPU メモリ使用量: {torch.cuda.memory_allocated(current_device)/1024**3:.2f} GB (割り当て済み)")
+        logger.info(f"GPU メモリ予約量: {torch.cuda.memory_reserved(current_device)/1024**3:.2f} GB (予約済み)")
+        logger.info(f"CUDA バージョン: {torch.version.cuda}")
+        
+        # 利用可能な最大メモリも表示（可能な場合）
+        try:
+            gpu_properties = torch.cuda.get_device_properties(current_device)
+            total_memory = gpu_properties.total_memory / 1024**3
+            logger.info(f"GPU 総メモリ: {total_memory:.2f} GB")
+        except:
+            pass
+    else:
+        logger.info("CPU環境での実行: GPU機能は利用できません")
+        # CPUスレッド数など、可能であれば表示
+        import multiprocessing
+        logger.info(f"CPU コア数: {multiprocessing.cpu_count()}")
+    logger.info("==========================")
+
+    # トークナイザーの初期化
+    logger.info(f"トークナイザーを初期化: {args.version}")
+    tokenizer = AutoTokenizer.from_pretrained(
         args.version,
         cache_dir=None,
         model_max_length=args.model_max_length,
@@ -128,14 +203,26 @@ def main(args):
     tokenizer.pad_token = tokenizer.unk_token
     num_added_tokens = tokenizer.add_tokens("[SEG]")
     seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
-    print(f"[SEG]トークンのインデックス: {seg_token_idx}")
+    logger.info(f"[SEG]トークンのインデックス: {seg_token_idx}")
 
+    # Gemma3の画像トークンを追加
+    gemma_image_token = "<start_of_image>"
+    num_added = tokenizer.add_tokens([gemma_image_token], special_tokens=True)
+    if num_added > 0:
+        gemma_image_token_id = tokenizer.convert_tokens_to_ids(gemma_image_token)
+        logger.info(f"Gemma3画像トークン '{gemma_image_token}' を追加しました。ID: {gemma_image_token_id}")
+    else:
+        logger.info(f"Gemma3画像トークン '{gemma_image_token}' は既に存在しています")
+    
+    # 標準の画像トークンも追加
     if args.use_mm_start_end:
         tokenizer.add_tokens(
-            [DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True
+            [DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, DEFAULT_IMAGE_TOKEN], 
+            special_tokens=True
         )
-        print("画像トークンを追加しました")
+        logger.info("標準画像トークンを追加しました")
 
+    # モデル引数の設定
     model_args = {
         "train_mask_decoder": args.train_mask_decoder,
         "out_dim": args.out_dim,
@@ -146,13 +233,15 @@ def main(args):
         "vision_pretrained": args.vision_pretrained,
         "use_mm_start_end": args.use_mm_start_end,
     }
+    
+    # 精度設定
     torch_dtype = torch.float32
     if args.precision == "bf16":
         torch_dtype = torch.bfloat16
     elif args.precision == "fp16":
         torch_dtype = torch.half
     
-    print("モデルを初期化しています...")
+    logger.info("モデルを初期化しています...")
     
     # 量子化設定
     if args.load_in_8bit or args.load_in_4bit:
@@ -184,16 +273,23 @@ def main(args):
         
         if args.gradient_checkpointing:
             model.gradient_checkpointing_enable()
+            
+        # トークナイザーでモデルの埋め込み層をリサイズ
+        model.resize_token_embeddings(len(tokenizer))
         
         # モデルのサイズを確認
         model_size = sum(p.numel() for p in model.parameters())
-        print(f"モデルのパラメータ数: {model_size:,}")
+        logger.info(f"モデルのパラメータ数: {model_size:,}")
+        
+        # モデルのデバイス情報を表示
+        device_info = next(model.parameters()).device
+        logger.info(f"現在のモデルデバイス: {device_info}")
         
         if not args.eval_only:
             # LoRAの設定
             lora_r = args.lora_r
             if lora_r > 0:
-                print(f"LoRAを適用しています (r={lora_r}, alpha={args.lora_alpha})...")
+                logger.info(f"LoRAを適用しています (r={lora_r}, alpha={args.lora_alpha})...")
                 
                 def find_linear_layers(model, lora_target_modules):
                     cls = torch.nn.Linear
@@ -218,7 +314,7 @@ def main(args):
                     return sorted(list(lora_module_names))
 
                 lora_target_modules = find_linear_layers(model, args.lora_target_modules.split(","))
-                print(f"LoRA適用レイヤー: {lora_target_modules}")
+                logger.info(f"LoRA適用レイヤー: {lora_target_modules}")
                 
                 peft_config = LoraConfig(
                     r=args.lora_r,
@@ -229,372 +325,192 @@ def main(args):
                     task_type="CAUSAL_LM",
                 )
                 model = get_peft_model(model, peft_config)
+                model.print_trainable_parameters()
+        
+        # デバッグモードの場合、設定を調整
+        if args.debug:
+            logger.info(f"==== デバッグモード有効: {args.debug_dataset}の最初の{args.debug_samples}例のみを使用 ====")
+            # デバッグモードでは少ないステップと短いエポックで学習
+            args.epochs = min(args.epochs, 2)
+            args.steps_per_epoch = 5
+            args.grad_accumulation_steps = 1  # 勾配蓄積を無効化
+            # データセット設定を指定されたデバッグデータセットのみに変更
+            if args.debug_dataset == "ade20k":
+                args.dataset = "sem_seg"
+                args.sem_seg_data = "ade20k"
+                args.sample_rates = "1"
+                args.val_dataset = "ReasonSeg|val"  # 検証データセットも設定
+            elif args.debug_dataset == "cocostuff":
+                args.dataset = "sem_seg"
+                args.sem_seg_data = "cocostuff"
+                args.sample_rates = "1"
+                args.val_dataset = "ReasonSeg|val"  # 検証データセットも設定
+            else:
+                # デフォルトはade20k
+                args.dataset = "sem_seg"
+                args.sem_seg_data = args.debug_dataset
+                args.sample_rates = "1"
+                args.val_dataset = "ReasonSeg|val"  # 検証データセットも設定
+            # 学習率とバッチサイズ調整
+            args.batch_size = 1
+            logger.info(f"デバッグ設定: エポック={args.epochs}, ステップ数={args.steps_per_epoch}, バッチ={args.batch_size}")
         
         # データセットの作成
-        print("データセットを初期化しています...")
+        logger.info("データセットを初期化しています...")
         
         if not args.eval_only:
+            # トレーニング用画像変換
+            train_transform = Compose([
+                ToTensor(),
+                RandomResizedCrop(
+                    size=(896, 896),  # Gemma3の推奨サイズ (SiGLIP ViT用)
+                    scale=(0.9, 1.0),
+                    interpolation=InterpolationMode.BICUBIC,
+                ),
+                Normalize(mean=[0.48145466, 0.4578275, 0.40821073], 
+                          std=[0.26862954, 0.26130258, 0.27577711]),
+            ])
+            
             train_dataset = HybridDataset(
                 args=args,
                 tokenizer=tokenizer,
-                vis_processor=None,
-                vis_processor_gemma=None,
-                conv_type=args.conv_type,
-                task_list=args.dataset.split("||"),
-                sample_rate=[float(s) for s in args.sample_rates.split(",")],
+                vision_tower=None,  # Gemma3ではvision_towerは不要
+                samples_per_epoch=args.steps_per_epoch * args.batch_size * args.grad_accumulation_steps,
+                debug_mode=args.debug,  # デバッグモードのフラグを渡す
+                debug_samples=args.debug_samples,  # デバッグサンプル数
+                transform=train_transform,
             )
-            print(f"トレーニングデータセットのサイズ: {len(train_dataset)}")
+            logger.info(f"トレーニングデータセットのサイズ: {len(train_dataset)}")
         else:
             train_dataset = None
 
-        if args.val_dataset:
+        if args.val_dataset and not args.no_eval:
+            # 文字列であることを確認
+            val_dataset_str = args.val_dataset
+            if isinstance(val_dataset_str, int):
+                # 整数の場合は文字列に変換（ReasonSeg|val形式を期待）
+                val_dataset_str = "ReasonSeg|val"
+                logger.info(f"val_datasetが整数値でした。デフォルト値 '{val_dataset_str}' を使用します。")
+            
+            # 検証用画像変換
+            val_transform = Compose([
+                ToTensor(),
+                RandomResizedCrop(
+                    size=(896, 896),  # Gemma3の推奨サイズ (SiGLIP ViT用)
+                    scale=(0.9, 1.0),
+                    interpolation=InterpolationMode.BICUBIC,
+                ),
+                Normalize(mean=[0.48145466, 0.4578275, 0.40821073], 
+                          std=[0.26862954, 0.26130258, 0.27577711]),
+            ])
+            
             val_dataset = ValDataset(
-                args=args,
-                tokenizer=tokenizer,
-                vis_processor=None,
-                vis_processor_gemma=None,
-                conv_type=args.conv_type,
-                task=args.val_dataset.split("|")[0],
-                split=args.val_dataset.split("|")[1],
+                args.dataset_dir, tokenizer, args.version, val_dataset_str, args.image_size, transform=val_transform
             )
-            print(f"検証データセットのサイズ: {len(val_dataset)}")
+            logger.info(f"検証データセットのサイズ: {len(val_dataset)}")
         else:
             val_dataset = None
+            
+        # TrainingArgumentsの設定
+        deepspeed_config = None
+        if DEEPSPEED_AVAILABLE and os.path.exists(args.deepspeed_config) and args.deepspeed_config != "None":
+            deepspeed_config = args.deepspeed_config
 
-        # データローダーの設定
-        if not args.eval_only:
-            train_sampler = torch.utils.data.distributed.DistributedSampler(
-                train_dataset,
-                shuffle=True,
-                seed=42,
-                drop_last=True,
-                rank=args.local_rank,
-                num_replicas=torch.cuda.device_count(),
-            )
-            train_loader = torch.utils.data.DataLoader(
-                train_dataset,
-                batch_size=args.batch_size,
-                shuffle=False,
-                num_workers=args.workers,
-                pin_memory=True,
-                sampler=train_sampler,
-                collate_fn=partial(
-                    collate_fn, tokenizer=tokenizer, conv_type=args.conv_type
-                ),
-            )
-        else:
-            train_loader = None
-            train_sampler = None
-
-        if val_dataset is not None:
-            val_sampler = torch.utils.data.distributed.DistributedSampler(
-                val_dataset,
-                shuffle=False,
-                seed=42,
-                drop_last=False,
-                rank=args.local_rank,
-                num_replicas=torch.cuda.device_count(),
-            )
-            val_loader = torch.utils.data.DataLoader(
-                val_dataset,
-                batch_size=args.val_batch_size,
-                shuffle=False,
-                num_workers=args.workers,
-                pin_memory=True,
-                sampler=val_sampler,
-                collate_fn=partial(
-                    collate_fn, tokenizer=tokenizer, conv_type=args.conv_type
-                ),
-            )
-        else:
-            val_loader = None
-            val_sampler = None
-
-        # オプティマイザーの設定
-        if not args.eval_only:
-            opt = torch.optim.AdamW(
-                filter(lambda p: p.requires_grad, model.parameters()),
-                lr=args.lr,
-                betas=(args.beta1, args.beta2),
-            )
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                opt, args.epochs * args.steps_per_epoch
-            )
-        else:
-            opt = None
-            scheduler = None
-
-        # チェックポイント読み込み
+        training_args = TrainingArguments(
+            output_dir=args.log_dir,
+            overwrite_output_dir=True,
+            num_train_epochs=args.epochs,
+            per_device_train_batch_size=args.batch_size,
+            per_device_eval_batch_size=args.val_batch_size,
+            gradient_accumulation_steps=args.grad_accumulation_steps,
+            learning_rate=args.lr,
+            weight_decay=0.0,
+            max_grad_norm=1.0,
+            warmup_ratio=0.03,
+            lr_scheduler_type="cosine",
+            logging_dir=os.path.join(args.log_dir, "logs"),
+            logging_steps=1,
+            save_steps=args.steps_per_epoch // 2,
+            save_total_limit=3,
+            evaluation_strategy="steps" if val_dataset is not None else "no",
+            eval_steps=args.steps_per_epoch // 2 if val_dataset is not None else None,
+            fp16=args.precision == "fp16",
+            bf16=args.precision == "bf16",
+            dataloader_num_workers=args.workers,
+            local_rank=args.local_rank,
+            remove_unused_columns=False,  # 画像データを保持するため
+            report_to=["tensorboard"],
+            label_names=["labels", "mask_labels"],  # モデルへの入力として渡す特別なキー
+            deepspeed=deepspeed_config,
+        )
+        
+        # カスタムTrainerのインスタンス化
+        trainer = GemmaLISATrainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=val_dataset,
+            data_collator=partial(collate_fn, tokenizer=tokenizer),
+            tokenizer=tokenizer,
+            # カスタム損失の重み
+            ce_loss_weight=args.ce_loss_weight,
+            bce_loss_weight=args.bce_loss_weight,
+            dice_loss_weight=args.dice_loss_weight,
+        )
+        
+        # 学習またはモデルのロード
+        # チェックポイントの復元
         if args.resume:
             if os.path.isfile(args.resume):
-                print(f"=> チェックポイントを読み込んでいます '{args.resume}'")
-                checkpoint = torch.load(args.resume, map_location="cpu")
-                args.start_epoch = checkpoint["epoch"]
-                model.load_state_dict(checkpoint["state_dict"])
-                opt.load_state_dict(checkpoint["optimizer"])
-                scheduler.load_state_dict(checkpoint["scheduler"])
-                print(f"=> エポック {checkpoint['epoch']} から再開します")
+                logger.info(f"チェックポイントを読み込みます: {args.resume}")
+                # Trainer.train() に前回のチェックポイントを渡して続きから学習
+                trainer_path = args.resume
             else:
-                print(f"=> チェックポイントが見つかりません '{args.resume}'")
+                logger.warning(f"チェックポイントが見つかりません: {args.resume}")
+                trainer_path = None
         elif args.auto_resume:
-            latest_checkpoint = os.path.join(args.log_dir, "checkpoint_latest.pt")
-            if os.path.isfile(latest_checkpoint):
-                print(f"=> 最新のチェックポイントを読み込んでいます '{latest_checkpoint}'")
-                checkpoint = torch.load(latest_checkpoint, map_location="cpu")
-                args.start_epoch = checkpoint["epoch"]
-                model.load_state_dict(checkpoint["state_dict"])
-                opt.load_state_dict(checkpoint["optimizer"])
-                scheduler.load_state_dict(checkpoint["scheduler"])
-                print(f"=> エポック {checkpoint['epoch']} から再開します")
-
-        # DeepSpeedの設定
-        ds_config = {
-            "train_micro_batch_size_per_gpu": args.batch_size,
-            "gradient_accumulation_steps": args.grad_accumulation_steps,
-            "optimizer": {
-                "type": "AdamW",
-                "params": {
-                    "lr": args.lr,
-                    "betas": [args.beta1, args.beta2],
-                },
-            },
-            "scheduler": {
-                "type": "WarmupDecayLR",
-                "params": {
-                    "warmup_min_lr": 0,
-                    "warmup_max_lr": args.lr,
-                    "warmup_num_steps": 100,
-                    "total_num_steps": args.epochs * args.steps_per_epoch,
-                },
-            },
-            "fp16": {
-                "enabled": args.precision == "fp16",
-            },
-            "bf16": {
-                "enabled": args.precision == "bf16",
-            },
-            "gradient_clipping": 1.0,
-            "zero_optimization": {
-                "stage": 2,
-                "overlap_comm": True,
-                "reduce_scatter": True,
-                "contiguous_gradients": True,
-            },
-        }
-
-        # DeepSpeedでモデルを初期化
-        model, opt, _, scheduler = deepspeed.initialize(
-            model=model,
-            optimizer=opt,
-            config=ds_config,
-            lr_scheduler=scheduler,
-            dist_init_required=True,
-        )
-
-        # 評価のみの場合
+            # 自動的に最新のチェックポイントを探す
+            latest = trainer._get_checkpoint_path()
+            if latest:
+                logger.info(f"最新のチェックポイントを読み込みます: {latest}")
+                trainer_path = latest
+            else:
+                logger.info("チェックポイントが見つからないため、初めから学習します")
+                trainer_path = None
+        else:
+            trainer_path = None
+            
+        # 評価モードまたはトレーニングモードを実行
         if args.eval_only:
-            evaluate(val_loader, model, tokenizer, args, val_dataset, 0, writer)
-            return
-
-        # トレーニングループ
-        print("トレーニングを開始します...")
-        for epoch in range(args.start_epoch, args.epochs):
-            if train_sampler is not None:
-                train_sampler.set_epoch(epoch)
-
-            # トレーニング
-            train_one_epoch(
-                train_loader,
-                model,
-                tokenizer,
-                opt,
-                scheduler,
-                epoch,
-                args,
-                writer,
-            )
-
-            # チェックポイント保存
-            if args.local_rank == 0:
-                save_checkpoint(
-                    {
-                        "epoch": epoch + 1,
-                        "state_dict": model.state_dict(),
-                        "optimizer": opt.state_dict(),
-                        "scheduler": scheduler.state_dict(),
-                    },
-                    False,
-                    args.log_dir,
-                )
-
-            # 評価
-            if not args.no_eval and val_loader is not None:
-                evaluate(val_loader, model, tokenizer, args, val_dataset, epoch, writer)
-
-        print("トレーニングが完了しました")
-        
+            if val_dataset:
+                logger.info("評価を開始します...")
+                metrics = trainer.evaluate(eval_dataset=val_dataset)
+                logger.info(f"評価結果: {metrics}")
+            else:
+                logger.warning("検証データセットが指定されていないため、評価をスキップします")
+        else:
+            logger.info("トレーニングを開始します...")
+            
+            # トレーニング開始直前のデバイス・メモリ情報を表示
+            train_device = next(model.parameters()).device
+            logger.info(f"トレーニング実行デバイス: {train_device}")
+            
+            if torch.cuda.is_available():
+                for i in range(torch.cuda.device_count()):
+                    logger.info(f"GPU {i} メモリ状態: "
+                               f"割り当て済み={torch.cuda.memory_allocated(i)/1024**3:.2f}GB, "
+                               f"予約済み={torch.cuda.memory_reserved(i)/1024**3:.2f}GB")
+            
+            # トレーニング実行
+            trainer.train(resume_from_checkpoint=trainer_path)
+            
+            # 最終モデルを保存
+            trainer.save_model()
+            logger.info(f"最終モデルを保存しました: {args.log_dir}")
+            
     except Exception as e:
-        print(f"エラーが発生しました: {e}")
-        import traceback
-        traceback.print_exc()
-
-
-def train_one_epoch(train_loader, model, tokenizer, optimizer, scheduler, epoch, args, writer):
-    """1エポックのトレーニング"""
-    batch_time = AverageMeter("Time", ":6.3f")
-    data_time = AverageMeter("Data", ":6.3f")
-    losses = AverageMeter("Loss", ":.4f")
-    ce_losses = AverageMeter("CE_Loss", ":.4f")
-    mask_bce_losses = AverageMeter("BCE_Loss", ":.4f")
-    mask_dice_losses = AverageMeter("Dice_Loss", ":.4f")
-    mask_losses = AverageMeter("Mask_Loss", ":.4f")
-    
-    progress = ProgressMeter(
-        args.steps_per_epoch,
-        [batch_time, data_time, losses, ce_losses, mask_bce_losses, mask_dice_losses, mask_losses],
-        prefix=f"Epoch: [{epoch}]",
-    )
-    
-    # モデルをトレーニングモードに設定
-    model.train()
-    
-    end = time.time()
-    for i, input_dict in enumerate(train_loader):
-        if i >= args.steps_per_epoch:
-            break
-        
-        # 計測：データロード時間
-        data_time.update(time.time() - end)
-        
-        # データをGPUに転送
-        input_dict = dict_to_cuda(input_dict)
-        
-        # フォワードパス
-        outputs = model(**input_dict)
-        loss = outputs["loss"]
-        ce_loss = outputs["ce_loss"] if "ce_loss" in outputs else 0
-        mask_bce_loss = outputs["mask_bce_loss"] if "mask_bce_loss" in outputs else 0
-        mask_dice_loss = outputs["mask_dice_loss"] if "mask_dice_loss" in outputs else 0
-        mask_loss = outputs["mask_loss"] if "mask_loss" in outputs else 0
-        
-        # バックワードパス
-        model.backward(loss)
-        model.step()
-        
-        # ロス値を記録
-        losses.update(loss.item(), input_dict["input_ids"].size(0))
-        ce_losses.update(ce_loss.item() if torch.is_tensor(ce_loss) else ce_loss, input_dict["input_ids"].size(0))
-        mask_bce_losses.update(mask_bce_loss.item() if torch.is_tensor(mask_bce_loss) else mask_bce_loss, input_dict["input_ids"].size(0))
-        mask_dice_losses.update(mask_dice_loss.item() if torch.is_tensor(mask_dice_loss) else mask_dice_loss, input_dict["input_ids"].size(0))
-        mask_losses.update(mask_loss.item() if torch.is_tensor(mask_loss) else mask_loss, input_dict["input_ids"].size(0))
-        
-        # 計測：バッチ処理時間
-        batch_time.update(time.time() - end)
-        end = time.time()
-        
-        # 進捗表示
-        if i % args.print_freq == 0:
-            progress.display(i)
-        
-        # TensorBoardにロス値を記録
-        if writer is not None and args.local_rank == 0:
-            step = epoch * args.steps_per_epoch + i
-            writer.add_scalar("train/loss", losses.val, step)
-            writer.add_scalar("train/ce_loss", ce_losses.val, step)
-            writer.add_scalar("train/mask_bce_loss", mask_bce_losses.val, step)
-            writer.add_scalar("train/mask_dice_loss", mask_dice_losses.val, step)
-            writer.add_scalar("train/mask_loss", mask_losses.val, step)
-            writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], step)
-
-
-def evaluate(val_loader, model, tokenizer, args, val_dataset, epoch, writer):
-    """モデルの評価"""
-    batch_time = AverageMeter("Time", ":6.3f")
-    
-    # 評価指標
-    intersection_meter = AverageMeter("Intersection", ":6.3f")
-    union_meter = AverageMeter("Union", ":6.3f")
-    
-    # モデルを評価モードに設定
-    model.eval()
-    
-    progress = ProgressMeter(
-        len(val_loader),
-        [batch_time, intersection_meter, union_meter],
-        prefix="Eval: ",
-    )
-    
-    with torch.no_grad():
-        end = time.time()
-        for i, input_dict in enumerate(val_loader):
-            # データをGPUに転送
-            input_dict = dict_to_cuda(input_dict)
-            
-            # 推論
-            input_ids = input_dict["input_ids"]
-            pixel_values = input_dict["pixel_values"]
-            images = input_dict["images"]
-            labels = input_dict.get("labels", None)
-            
-            # リサイズサイズと元のサイズを取得
-            resize_list = input_dict.get("resize_list", None)
-            original_size_list = input_dict.get("original_size_list", None)
-            
-            # 評価用の推論
-            results = model.evaluate(
-                pixel_values=pixel_values,
-                images=images,
-                input_ids=input_ids,
-                resize_list=resize_list, 
-                original_size_list=original_size_list,
-                max_new_tokens=128,
-                tokenizer=tokenizer,
-            )
-            
-            # 予測結果を取得
-            pred_masks = results["masks"] if "masks" in results else None
-            
-            if pred_masks is not None and "gt_masks" in input_dict:
-                # セグメンテーション評価指標の計算
-                gt_masks = input_dict["gt_masks"]
-                for pred_mask, gt_mask in zip(pred_masks, gt_masks):
-                    if pred_mask is not None and gt_mask is not None:
-                        pred_mask = pred_mask.bool()
-                        gt_mask = gt_mask.bool()
-                        intersection, union = intersectionAndUnionGPU(
-                            pred_mask.float(), gt_mask.float(), 2
-                        )
-                        intersection_meter.update(intersection[1].item())
-                        union_meter.update(union[1].item())
-            
-            # 計測：バッチ処理時間
-            batch_time.update(time.time() - end)
-            end = time.time()
-            
-            # 進捗表示
-            if i % args.print_freq == 0:
-                progress.display(i)
-        
-        # IoU計算
-        iou = intersection_meter.sum / (union_meter.sum + 1e-10)
-        
-        # 結果表示
-        print(f"Validation IoU: {iou:.4f}")
-        
-        # TensorBoardに評価結果を記録
-        if writer is not None and args.local_rank == 0:
-            writer.add_scalar("val/IoU", iou, epoch)
-            
-        return iou
-
-
-def save_checkpoint(state, is_best, log_dir, filename="checkpoint_latest.pt"):
-    """チェックポイントの保存"""
-    torch.save(state, os.path.join(log_dir, filename))
-    if is_best:
-        shutil.copyfile(
-            os.path.join(log_dir, filename), os.path.join(log_dir, "checkpoint_best.pt")
-        )
+        logger.exception(f"エラーが発生しました: {e}")
+        raise e
 
 
 if __name__ == "__main__":
